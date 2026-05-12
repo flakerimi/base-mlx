@@ -31,23 +31,115 @@ pub fn search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Look for `hf_repo` in any known local cache. Returns the directory
-/// containing `config.json` if found.
-pub fn find_local(hf_repo: &str) -> Option<PathBuf> {
-    let mangled = hf_repo.replace('/', "--");
-    let (owner, name) = hf_repo.split_once('/').unwrap_or((hf_repo, hf_repo));
+/// Look for a model on disk. Tries, in order:
+///   1. Exact path under each cache root (base-mlx layout + LM Studio layout).
+///   2. Case-insensitive substring match against any local model dir
+///      that contains a `config.json`. This is what makes
+///      `qwen3-4b-instruct-2507` resolve to LM Studio's
+///      `mlx-community/Qwen3-4B-Instruct-2507-4bit/`.
+pub fn find_local(query: &str) -> Option<PathBuf> {
+    let mangled = query.replace('/', "--");
+    let (owner, name) = query.split_once('/').unwrap_or((query, query));
 
+    // 1. Exact paths.
     for base in search_dirs() {
         for candidate in [
-            base.join(&mangled),     // base-mlx layout
-            base.join(owner).join(name), // LM Studio layout
+            base.join(&mangled),
+            base.join(owner).join(name),
         ] {
             if candidate.join("config.json").exists() {
                 return Some(candidate);
             }
         }
     }
-    None
+
+    // 2. Fuzzy: enumerate all `config.json`-bearing directories under
+    //    each search root, then rank by how well their path matches the
+    //    query. Longest case-insensitive substring overlap wins.
+    let q = query.to_ascii_lowercase();
+    let mut best: Option<(usize, PathBuf)> = None;
+    for base in search_dirs() {
+        for dir in scan_model_dirs(&base) {
+            // Match against both the last path segment (typical name)
+            // and the full path tail relative to the search root so
+            // `mlx-community/Qwen3-4B-Instruct-2507-4bit` still wins
+            // even when the query is just `Qwen3-4B-Instruct-2507`.
+            let leaf = dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            let rel = dir
+                .strip_prefix(&base)
+                .ok()
+                .map(|p| p.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_else(|| leaf.clone());
+            let score = match_score(&q, &rel).max(match_score(&q, &leaf));
+            if score > 0 && score >= best.as_ref().map(|(s, _)| *s).unwrap_or(0) {
+                best = Some((score, dir));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn scan_model_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.join("config.json").exists() {
+            out.push(p);
+        } else {
+            // Recurse one level (LM Studio: <owner>/<name>/config.json).
+            if let Ok(inner) = std::fs::read_dir(&p) {
+                for ie in inner.flatten() {
+                    let ip = ie.path();
+                    if ip.is_dir() && ip.join("config.json").exists() {
+                        out.push(ip);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Crude scoring: number of characters in `query` that appear in
+/// `candidate` as a single contiguous substring, case-insensitive.
+/// Zero means no useful overlap.
+fn match_score(query: &str, candidate: &str) -> usize {
+    if query.is_empty() || candidate.is_empty() {
+        return 0;
+    }
+    if candidate.contains(query) {
+        return query.len() * 2; // strong bonus for full substring match
+    }
+    // Otherwise look for longest contiguous run of query chars present in
+    // candidate. Cheap heuristic; we'll do something smarter when we
+    // have a proper local-model registry.
+    let qb = query.as_bytes();
+    let cb = candidate.as_bytes();
+    let mut best = 0usize;
+    for start in 0..qb.len() {
+        let mut run = 0usize;
+        for k in 0..(qb.len() - start) {
+            let needle = &qb[start..start + k + 1];
+            if cb.windows(needle.len()).any(|w| w == needle) {
+                run = k + 1;
+            } else {
+                break;
+            }
+        }
+        if run > best {
+            best = run;
+        }
+    }
+    best
 }
 
 /// Filenames worth attempting; absence of any single file is non-fatal so
