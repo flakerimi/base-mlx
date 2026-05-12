@@ -76,6 +76,11 @@ impl LoadedModel {
         // Prefill.
         let mut logits = self.model.forward(prompt_tokens, &mut cache)?;
         let mut text = String::new();
+        // Buffer of *all* generated token ids so far. We decode the
+        // whole buffer each step and emit only the newly-completed
+        // suffix — this collapses the multi-byte UTF-8 boundary bug
+        // (single-token decode of a byte mid-codepoint returns `�`).
+        let mut produced_ids: Vec<u32> = Vec::with_capacity(max_new_tokens as usize + 1);
         let mut produced = 0u32;
         let mut finish = "length";
 
@@ -86,13 +91,37 @@ impl LoadedModel {
                 finish = "stop";
                 break;
             }
-            let piece = self.tokenizer.decode(&[next], false)?;
-            on_token(&piece, next);
-            text.push_str(&piece);
+            produced_ids.push(next);
+            let full = self.tokenizer.decode(&produced_ids, false)?;
+            // Hold back the trailing fragment if it ends mid-codepoint —
+            // tokenizers render incomplete bytes as `\u{FFFD}`. We slice
+            // off any trailing replacement character so it can complete
+            // on the next step.
+            let emit_end = match full.rfind('\u{FFFD}') {
+                Some(idx) if idx == full.len() - '\u{FFFD}'.len_utf8() => idx,
+                _ => full.len(),
+            };
+            if emit_end > text.len() {
+                let piece = &full[text.len()..emit_end];
+                on_token(piece, next);
+                text.push_str(piece);
+            }
             if produced >= max_new_tokens {
                 break;
             }
             logits = self.model.forward(&[next], &mut cache)?;
+        }
+
+        // Drain any final pending bytes (e.g. EOS landed mid-codepoint).
+        if !produced_ids.is_empty() {
+            let full = self.tokenizer.decode(&produced_ids, false)?;
+            if full.len() > text.len() {
+                let tail = &full[text.len()..];
+                if !tail.contains('\u{FFFD}') {
+                    on_token(tail, 0);
+                    text.push_str(tail);
+                }
+            }
         }
 
         // Extract tool calls from the final text. If any are present we
