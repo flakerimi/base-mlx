@@ -10,7 +10,6 @@ use crate::{Error, Result};
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -110,15 +109,21 @@ struct Qwen3Layer {
 
 // ─── Model ──────────────────────────────────────────────────────────────────
 
-/// Per-layer K/V cache. Each entry is `[kv_heads, seq_len_so_far, head_dim]`
-/// in the rotated frame — RoPE was already applied at the position the
-/// tokens were first seen, so cached entries don't get re-rotated.
+/// Per-layer K/V cache. Each entry is pre-allocated to
+/// `[kv_heads, KV_PREALLOC, head_dim]` once at first use; we write new
+/// rows in place via `index_mut` rather than concatenating a fresh
+/// Metal buffer every step. RoPE was already applied at the position
+/// the tokens were first seen, so cached entries don't get re-rotated.
 #[derive(Debug, Default)]
 pub struct KvCache {
     pub k: Vec<mlx_rs::Array>,
     pub v: Vec<mlx_rs::Array>,
     pub seq_len: usize,
 }
+
+/// Max context we'll cache before erroring. 4096 covers the typical
+/// chat / agent flow; we can bump or make configurable later.
+pub const KV_PREALLOC: i32 = 4096;
 
 impl KvCache {
     pub fn new() -> Self {
@@ -128,6 +133,9 @@ impl KvCache {
         self.k.clear();
         self.v.clear();
         self.seq_len = 0;
+    }
+    pub fn is_initialized(&self) -> bool {
+        !self.k.is_empty()
     }
 }
 
@@ -264,9 +272,7 @@ impl Qwen3 {
             None
         };
 
-        // Make sure the cache has a slot per layer (first call lazily
-        // appends; subsequent calls find existing entries to extend).
-        let extending = !cache.k.is_empty();
+        let extending = cache.is_initialized();
         if extending && cache.k.len() != self.layers.len() {
             return Err(Error::Inference(format!(
                 "cache layer count {} != model layers {}",
@@ -330,8 +336,10 @@ impl Qwen3 {
             let k = mlx_rs::fast::rope(&k, head_dim, false, self.cfg.rope_theta, 1.0, offset, None)
                 .map_err(emap)?;
 
-            // Extend (or seed) the per-layer K/V cache. We store the
-            // pre-GQA-expansion versions so the cache stays small.
+            // Extend or seed the per-layer K/V cache. Concat each step is
+            // O(N) per layer; LM Studio uses in-place slice writes but
+            // mlx-rs's try_index_mut doesn't optimize to in-place when
+            // it can't prove refcount=1, so we eat the concat cost.
             let (k_cached, v_cached) = if extending {
                 let kk = mlx_rs::ops::concatenate_axis(&[&cache.k[li], &k], 1).map_err(emap)?;
                 let vv = mlx_rs::ops::concatenate_axis(&[&cache.v[li], &v], 1).map_err(emap)?;
@@ -344,7 +352,6 @@ impl Qwen3 {
                 (k, v)
             };
 
-            // GQA: repeat kv heads along the heads axis (axis 0).
             let k = mlx_rs::ops::repeat_axis::<i32>(k_cached, repeats, 0).map_err(emap)?;
             let v = mlx_rs::ops::repeat_axis::<i32>(v_cached, repeats, 0).map_err(emap)?;
 
