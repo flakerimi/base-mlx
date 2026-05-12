@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+.idea/
+.vscode/
+.zed/
+
+# Local model cache
+/models
+/.cache
+
+# Env / secrets
+.env
+.env.local

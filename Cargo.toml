@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/base-mlx-core",
+    "crates/base-mlx-server",
+    "crates/base-mlx-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/base-go/base-mlx"
+homepage = "https://github.com/base-go/base-mlx"
+authors = ["base-mlx contributors"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+# Tensor / MLX
+mlx-rs = "0.25"
+
+# HTTP + async
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+futures = "0.3"
+async-stream = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Model weights
+safetensors = "0.4"
+
+# Tokenizers (HuggingFace Rust)
+tokenizers = { version = "0.20", default-features = false, features = ["onig", "http"] }
+
+# Utility
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+rand = "0.8"
+indexmap = "2"
+async-trait = "0.1"
+
+# Internal
+base-mlx-core = { path = "crates/base-mlx-core" }
+base-mlx-server = { path = "crates/base-mlx-server" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
