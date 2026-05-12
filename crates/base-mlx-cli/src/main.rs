@@ -132,31 +132,44 @@ async fn main() -> Result<()> {
             print!("\nGeneration: {}", prompt);
             std::io::stdout().flush().ok();
 
-            let mut all_tokens = tokens.clone();
+            let mut cache = base_mlx_core::model::qwen3::KvCache::new();
+            // Prefill the prompt in one go.
+            let t_prefill = std::time::Instant::now();
+            let mut logits = model.forward(&tokens, &mut cache)?;
+            logits.eval().ok();
+            let prefill_ms = t_prefill.elapsed().as_secs_f32() * 1000.0;
+
             let t1 = std::time::Instant::now();
             let mut produced = 0u32;
-            for _ in 0..max_tokens {
-                let logits = model.forward(&all_tokens)?;
+            let mut next: u32;
+            loop {
                 let argmax = mlx_rs::ops::indexing::argmax(&logits, false)
                     .map_err(|e| anyhow::anyhow!("argmax: {e}"))?;
                 argmax.eval().ok();
-                let next_id = argmax.as_slice::<u32>()[0];
+                next = argmax.as_slice::<u32>()[0];
                 produced += 1;
                 // EOS: 151645 = <|im_end|>, 151643 = <|endoftext|>.
-                if next_id == 151645 || next_id == 151643 {
+                if next == 151645 || next == 151643 {
                     break;
                 }
-                let piece = tok.decode(&[next_id], false)?;
+                let piece = tok.decode(&[next], false)?;
                 print!("{}", piece);
                 std::io::stdout().flush().ok();
-                all_tokens.push(next_id);
+                if produced >= max_tokens {
+                    break;
+                }
+                // Feed one token at a time; cache holds the rest.
+                logits = model.forward(&[next], &mut cache)?;
             }
-            let elapsed = t1.elapsed().as_secs_f32();
+            let decode_s = t1.elapsed().as_secs_f32();
+            let decode_only = (produced.saturating_sub(1)) as f32;
             println!(
-                "\n[{} tokens in {:.2}s — {:.1} tok/s; reprefill, no KV cache]",
+                "\n[prefill {} tok in {:.0}ms · decode {} tok in {:.2}s → {:.1} tok/s]",
+                tokens.len(),
+                prefill_ms,
                 produced,
-                elapsed,
-                produced as f32 / elapsed.max(0.001),
+                decode_s,
+                decode_only / decode_s.max(0.001),
             );
             Ok(())
         }

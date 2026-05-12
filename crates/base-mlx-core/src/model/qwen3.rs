@@ -107,6 +107,27 @@ struct Qwen3Layer {
 
 // ─── Model ──────────────────────────────────────────────────────────────────
 
+/// Per-layer K/V cache. Each entry is `[kv_heads, seq_len_so_far, head_dim]`
+/// in the rotated frame — RoPE was already applied at the position the
+/// tokens were first seen, so cached entries don't get re-rotated.
+#[derive(Debug, Default)]
+pub struct KvCache {
+    pub k: Vec<mlx_rs::Array>,
+    pub v: Vec<mlx_rs::Array>,
+    pub seq_len: usize,
+}
+
+impl KvCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn reset(&mut self) {
+        self.k.clear();
+        self.v.clear();
+        self.seq_len = 0;
+    }
+}
+
 #[derive(Debug)]
 pub struct Qwen3 {
     pub cfg: ModelConfig,
@@ -206,16 +227,19 @@ impl Qwen3 {
         })
     }
 
-    /// Run the prompt through the model and return logits for the last
-    /// position. Shape: `[vocab_size]`. No KV cache yet — every call
-    /// reprefills the full sequence.
-    pub fn forward(&self, tokens: &[u32]) -> Result<Array> {
+    /// Run `tokens` through the model and return logits for the *last*
+    /// position. Shape: `[vocab_size]`. `cache` is extended in place:
+    ///   - First call (empty cache): full prefill on the whole prompt.
+    ///   - Subsequent calls: pass *only the new tokens* (typically one
+    ///     during greedy decode) — cached K/V handle the rest.
+    pub fn forward(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Array> {
         let head_dim = self.cfg.per_head_dim() as i32;
         let n_heads = self.cfg.num_attention_heads as i32;
         let kv_heads = self.cfg.kv_heads() as i32;
         let repeats = n_heads / kv_heads;
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
         let seq_len = tokens.len() as i32;
+        let offset = cache.seq_len as i32;
 
         // tokens → int32 array
         let token_ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
@@ -224,12 +248,31 @@ impl Qwen3 {
         // [seq, hidden]
         let mut x = self.embed.lookup(&tok_arr)?;
 
-        // Causal mask: [seq, seq], lower triangle of 0s, above-diag = -inf.
-        // SDPA expects [num_heads, seq_q, seq_k] or broadcastable; we build
-        // [1, 1, seq, seq] so it broadcasts over batch and heads.
-        let mask = causal_mask(seq_len, x.dtype())?;
+        // Mask:
+        //   - prefill with multi-token input (offset=0, seq_len>1): full
+        //     causal [seq, seq] mask.
+        //   - single-token decode (seq_len==1): no mask needed; the one
+        //     query attends to every cached key (and itself).
+        //   - extending multi-token chunks against an existing cache is
+        //     also possible but rare — skip until we need it.
+        let mask = if seq_len > 1 {
+            Some(causal_mask(seq_len, x.dtype())?)
+        } else {
+            None
+        };
 
-        for layer in &self.layers {
+        // Make sure the cache has a slot per layer (first call lazily
+        // appends; subsequent calls find existing entries to extend).
+        let extending = !cache.k.is_empty();
+        if extending && cache.k.len() != self.layers.len() {
+            return Err(Error::Inference(format!(
+                "cache layer count {} != model layers {}",
+                cache.k.len(),
+                self.layers.len()
+            )));
+        }
+
+        for (li, layer) in self.layers.iter().enumerate() {
             // ── Attention ──
             let h = layer.input_norm.forward(&x)?;
 
@@ -258,24 +301,49 @@ impl Qwen3 {
             let k = k.transpose_axes(&[1, 0, 2]).map_err(emap)?;
             let v = v.transpose_axes(&[1, 0, 2]).map_err(emap)?;
 
-            // RoPE on [heads, seq, head_dim]. offset=0 for a full prefill;
-            // KV cache milestone will pass the prior length.
-            let q = mlx_rs::fast::rope(&q, head_dim, false, self.cfg.rope_theta, 1.0, 0, None)
+            // RoPE on [heads, seq, head_dim] with the right offset so
+            // cached keys (rotated at their original positions) line up
+            // with newly-rotated queries.
+            let q = mlx_rs::fast::rope(&q, head_dim, false, self.cfg.rope_theta, 1.0, offset, None)
                 .map_err(emap)?;
-            let k = mlx_rs::fast::rope(&k, head_dim, false, self.cfg.rope_theta, 1.0, 0, None)
+            let k = mlx_rs::fast::rope(&k, head_dim, false, self.cfg.rope_theta, 1.0, offset, None)
                 .map_err(emap)?;
 
-            // GQA: repeat kv heads along the heads axis (axis 0 now).
-            let k = mlx_rs::ops::repeat_axis::<i32>(k, repeats, 0).map_err(emap)?;
-            let v = mlx_rs::ops::repeat_axis::<i32>(v, repeats, 0).map_err(emap)?;
+            // Extend (or seed) the per-layer K/V cache. We store the
+            // pre-GQA-expansion versions so the cache stays small.
+            let (k_cached, v_cached) = if extending {
+                let kk = mlx_rs::ops::concatenate_axis(&[&cache.k[li], &k], 1).map_err(emap)?;
+                let vv = mlx_rs::ops::concatenate_axis(&[&cache.v[li], &v], 1).map_err(emap)?;
+                cache.k[li] = kk.clone();
+                cache.v[li] = vv.clone();
+                (kk, vv)
+            } else {
+                cache.k.push(k.clone());
+                cache.v.push(v.clone());
+                (k, v)
+            };
+
+            // GQA: repeat kv heads along the heads axis (axis 0).
+            let k = mlx_rs::ops::repeat_axis::<i32>(k_cached, repeats, 0).map_err(emap)?;
+            let v = mlx_rs::ops::repeat_axis::<i32>(v_cached, repeats, 0).map_err(emap)?;
 
             // SDPA expects [batch, heads, seq, dim] — add a unit batch.
             let q = q.expand_dims(0).map_err(emap)?;
             let k = k.expand_dims(0).map_err(emap)?;
             let v = v.expand_dims(0).map_err(emap)?;
 
-            let attn = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, &mask)
-                .map_err(emap)?;
+            let attn = match &mask {
+                Some(m) => mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, m)
+                    .map_err(emap)?,
+                None => mlx_rs::fast::scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    Option::<mlx_rs::fast::ScaledDotProductAttentionMask<'_>>::None,
+                )
+                .map_err(emap)?,
+            };
 
             // [1, heads, seq, dim] → [seq, heads*dim]
             let attn = attn
@@ -303,6 +371,7 @@ impl Qwen3 {
             None => self.embed.lm_head(&x)?,
         };
 
+        cache.seq_len += seq_len as usize;
         // Last token's logits: [vocab].
         Ok(logits.index((seq_len - 1, ..)))
     }
