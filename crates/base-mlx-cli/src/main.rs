@@ -126,23 +126,37 @@ async fn main() -> Result<()> {
             let model = base_mlx_core::model::Qwen3::load(&dir, cfg)?;
             println!("  loaded in {:.2}s", t0.elapsed().as_secs_f32());
 
-            // One forward pass — argmax of last-position logits.
-            println!("Running forward pass…");
-            let t1 = std::time::Instant::now();
-            let logits = model.forward(&tokens)?;
-            logits.eval().ok();
-            println!("  prefill in {:.2}s", t1.elapsed().as_secs_f32());
+            // Greedy decode loop. O(n²) without a KV cache — fine for v1
+            // verification; KV cache lands in the next milestone.
+            use std::io::Write;
+            print!("\nGeneration: {}", prompt);
+            std::io::stdout().flush().ok();
 
-            // 1-D logits → global argmax is fine here.
-            let argmax = mlx_rs::ops::indexing::argmax(&logits, false)
-                .map_err(|e| anyhow::anyhow!("argmax: {e}"))?;
-            argmax.eval().ok();
-            let next_id = argmax.as_slice::<u32>()[0];
-            let next_text = tok.decode(&[next_id], false)?;
-            println!("Next token (greedy): {} → {:?}", next_id, next_text);
+            let mut all_tokens = tokens.clone();
+            let t1 = std::time::Instant::now();
+            let mut produced = 0u32;
+            for _ in 0..max_tokens {
+                let logits = model.forward(&all_tokens)?;
+                let argmax = mlx_rs::ops::indexing::argmax(&logits, false)
+                    .map_err(|e| anyhow::anyhow!("argmax: {e}"))?;
+                argmax.eval().ok();
+                let next_id = argmax.as_slice::<u32>()[0];
+                produced += 1;
+                // EOS: 151645 = <|im_end|>, 151643 = <|endoftext|>.
+                if next_id == 151645 || next_id == 151643 {
+                    break;
+                }
+                let piece = tok.decode(&[next_id], false)?;
+                print!("{}", piece);
+                std::io::stdout().flush().ok();
+                all_tokens.push(next_id);
+            }
+            let elapsed = t1.elapsed().as_secs_f32();
             println!(
-                "(decode loop / max_tokens={} not wired yet — that's the next milestone)",
-                max_tokens
+                "\n[{} tokens in {:.2}s — {:.1} tok/s; reprefill, no KV cache]",
+                produced,
+                elapsed,
+                produced as f32 / elapsed.max(0.001),
             );
             Ok(())
         }
