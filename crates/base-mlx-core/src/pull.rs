@@ -31,6 +31,21 @@ pub fn search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Strict exact-path lookup — used for catalog repo strings where a
+/// fuzzy hit on a different model would be a lie.
+pub fn find_local_exact(hf_repo: &str) -> Option<PathBuf> {
+    let mangled = hf_repo.replace('/', "--");
+    let (owner, name) = hf_repo.split_once('/').unwrap_or((hf_repo, hf_repo));
+    for base in search_dirs() {
+        for candidate in [base.join(&mangled), base.join(owner).join(name)] {
+            if candidate.join("config.json").exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Look for a model on disk. Tries, in order:
 ///   1. Exact path under each cache root (base-mlx layout + LM Studio layout).
 ///   2. Case-insensitive substring match against any local model dir
@@ -80,6 +95,17 @@ pub fn find_local(query: &str) -> Option<PathBuf> {
         }
     }
     best.map(|(_, p)| p)
+}
+
+/// All locally-available model directories across every search root.
+/// Each entry contains a `config.json`; use it to enumerate what we can
+/// actually serve right now without a download.
+pub fn local_models() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for base in search_dirs() {
+        out.extend(scan_model_dirs(&base));
+    }
+    out
 }
 
 fn scan_model_dirs(root: &Path) -> Vec<PathBuf> {

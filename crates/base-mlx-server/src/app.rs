@@ -23,10 +23,17 @@ impl Default for ServerConfig {
 }
 
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
-    // Cap MLX's Metal free-list at 1 GiB. The default is unbounded and
+    // Cap MLX's Metal free-list at 8 GiB. The default is unbounded and
     // grows unbounded too (one buffer per unique tensor shape) — during
     // long decode runs the process RSS climbs past 20 GB without this.
-    if let Err(e) = base_mlx_core::memory::set_cache_limit(1 << 30) {
+    // 1 GiB (our original cap) was too small for 1500-token KV cache
+    // growth on a 4B model: every step's concat allocates a slightly
+    // bigger buffer, the free-list spills, and the next request inherits
+    // a fragmented heap. 8 GiB gives MLX room to reuse the full growth
+    // curve without ever returning buffers to the OS mid-request, while
+    // still leaving 24 GiB of unified memory for everything else on a
+    // 32 GB machine.
+    if let Err(e) = base_mlx_core::memory::set_cache_limit(16 << 30) {
         tracing::warn!(error = %e, "failed to cap MLX cache");
     }
 

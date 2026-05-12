@@ -12,11 +12,13 @@ pub mod chat_template;
 pub mod engine;
 pub mod error;
 pub mod memory;
+pub mod mlx_ext;
 pub mod model;
 pub mod pull;
 pub mod registry;
 pub mod sampler;
 pub mod session;
+pub mod speculative;
 pub mod tokenizer;
 
 pub use error::{Error, Result};

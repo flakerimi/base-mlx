@@ -6,7 +6,7 @@
 
 use crate::state::AppState;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
@@ -21,25 +21,135 @@ use base_mlx_core::sampler::SamplingParams;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::convert::Infallible;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
+use tracing::info;
 use uuid::Uuid;
+
+/// Log a one-line memory + throughput snapshot around a generation.
+/// `tag` is "oneshot" or "stream"; `f` runs the actual generate call.
+/// We sample MLX's active + cache bytes immediately before and after so
+/// run-over-run drift is visible without extra tooling.
+fn instrumented<F, T>(tag: &'static str, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let active_before = base_mlx_core::memory::active_bytes().unwrap_or(0);
+    let cache_before = base_mlx_core::memory::cache_bytes().unwrap_or(0);
+    let t0 = Instant::now();
+    let out = f();
+    let elapsed = t0.elapsed();
+    let active_after = base_mlx_core::memory::active_bytes().unwrap_or(0);
+    let cache_after = base_mlx_core::memory::cache_bytes().unwrap_or(0);
+    info!(
+        tag = tag,
+        elapsed_ms = elapsed.as_millis() as u64,
+        active_mb_before = active_before / 1024 / 1024,
+        active_mb_after = active_after / 1024 / 1024,
+        cache_mb_before = cache_before / 1024 / 1024,
+        cache_mb_after = cache_after / 1024 / 1024,
+        "gen done",
+    );
+    out
+}
 
 // ─── /v1/models ─────────────────────────────────────────────────────────────
 
-pub async fn list_models() -> Json<Value> {
-    let data: Vec<_> = registry::default_catalog()
-        .into_iter()
-        .map(|m| {
-            json!({
+pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
+    use base_mlx_core::pull;
+
+    // Currently loaded model ids. Multiple may be resident (target +
+    // draft for speculative decoding). Empty means first chat request
+    // will trigger a load. We pick the first key for the legacy scalar
+    // `loaded` field at the response root; per-entry `loaded:` flags
+    // cover the full picture.
+    let loaded_ids: Vec<String> = state
+        .models
+        .lock()
+        .ok()
+        .map(|g| g.keys().cloned().collect())
+        .unwrap_or_default();
+    let loaded_id: Option<String> = loaded_ids.first().cloned();
+
+    // Enumerate every locally-available model — anything with a
+    // `config.json` under our cache or LM Studio's models tree. Each
+    // entry's `id` is the path-derived name (e.g. `Qwen3-4B-Instruct-2507-4bit`
+    // or `mlx-community/Qwen3-4B-Instruct-2507-4bit`) so callers can hand
+    // it back to chat completions and resolve cleanly via the fuzzy
+    // matcher. We also surface the curated catalog ids when there's a
+    // local hit for them — that gives consumers the friendly short
+    // names too.
+    let catalog = registry::default_catalog();
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    let mut data = Vec::<Value>::new();
+
+    // First: catalog entries that resolve to a local copy.
+    for m in &catalog {
+        if pull::find_local_exact(&m.hf_repo).is_some() {
+            seen.insert(m.id.clone());
+            let is_loaded = loaded_ids.iter().any(|x| x == &m.id);
+            data.push(json!({
                 "id": m.id,
                 "object": "model",
                 "owned_by": "base-mlx",
                 "name": m.name,
                 "role": format!("{:?}", m.role).to_lowercase(),
-            })
-        })
-        .collect();
-    Json(json!({ "object": "list", "data": data }))
+                "local": true,
+                "loaded": is_loaded,
+            }));
+        }
+    }
+
+    // Then: every other on-disk model the catalog doesn't cover.
+    for dir in pull::local_models() {
+        // Compute a stable id from the path: `<parent>/<leaf>` when
+        // hosted under an org dir (LM Studio layout), otherwise the
+        // leaf directly.
+        let leaf = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let parent = dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        // Skip our own cache root names; only namespace when parent
+        // looks like an HF owner (no spaces, contains alphanum).
+        let id = if !parent.is_empty()
+            && parent != "models"
+            && parent.chars().any(|c| c.is_alphabetic())
+            && !parent.starts_with('.')
+        {
+            format!("{parent}/{leaf}")
+        } else {
+            leaf.to_string()
+        };
+        if id.is_empty() || seen.contains(&id) {
+            continue;
+        }
+        // Also skip if any catalog id already represents this dir.
+        let already = catalog.iter().any(|m| {
+            pull::find_local_exact(&m.hf_repo)
+                .map(|d| d == dir)
+                .unwrap_or(false)
+                && seen.contains(&m.id)
+        });
+        if already {
+            continue;
+        }
+        seen.insert(id.clone());
+        let is_loaded = loaded_ids.iter().any(|x| x == &id);
+        data.push(json!({
+            "id": id,
+            "object": "model",
+            "owned_by": "base-mlx",
+            "local": true,
+            "loaded": is_loaded,
+        }));
+    }
+
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "loaded": loaded_id,
+    }))
 }
 
 // ─── /v1/chat/completions ───────────────────────────────────────────────────
@@ -65,6 +175,14 @@ pub struct ChatRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub response_format: Option<Value>,
+}
+
+/// Query-string knobs that don't fit the OpenAI JSON body. Right now
+/// just `?spec=<draft_id>` to opt into speculative decoding per request.
+#[derive(Debug, Default, Deserialize)]
+pub struct ChatQuery {
+    #[serde(default)]
+    pub spec: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +212,7 @@ fn err(code: StatusCode, msg: impl Into<String>, kind: &'static str) -> Response
 
 pub async fn chat_completions(
     State(state): State<AppState>,
+    Query(q): Query<ChatQuery>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
     if req.messages.is_empty() {
@@ -129,6 +248,7 @@ pub async fn chat_completions(
             req.tools.clone(),
             params,
             max_tokens,
+            q.spec.clone(),
         )
         .await
     } else {
@@ -140,6 +260,7 @@ pub async fn chat_completions(
             params,
             max_tokens,
             req.response_format.clone(),
+            q.spec.clone(),
         )
         .await
     }
@@ -196,18 +317,35 @@ fn with_loaded<R>(
     model_id: &str,
     f: impl FnOnce(&LoadedModel) -> R,
 ) -> Result<R, base_mlx_core::Error> {
-    let mut slot = state.model.lock().expect("model lock poisoned");
-    let need_load = match slot.as_ref() {
-        Some((id, _)) => id != model_id,
-        None => true,
-    };
-    if need_load {
-        slot.take(); // free RAM before loading the next model
+    let mut map = state.models.lock().expect("model lock poisoned");
+    if !map.contains_key(model_id) {
         let loaded = LoadedModel::load(model_id)?;
-        *slot = Some((model_id.to_string(), loaded));
+        map.insert(model_id.to_string(), loaded);
     }
-    let (_, loaded) = slot.as_ref().expect("just inserted");
+    let loaded = map.get(model_id).expect("just inserted");
     Ok(f(loaded))
+}
+
+/// Same as `with_loaded` but yields both a target and a draft model.
+/// Used by speculative decoding. Both are loaded if absent; both stay
+/// resident across requests (no LRU yet).
+fn with_target_and_draft<R>(
+    state: &AppState,
+    target_id: &str,
+    draft_id: &str,
+    f: impl FnOnce(&LoadedModel, &LoadedModel) -> R,
+) -> Result<R, base_mlx_core::Error> {
+    let mut map = state.models.lock().expect("model lock poisoned");
+    if !map.contains_key(target_id) {
+        map.insert(target_id.to_string(), LoadedModel::load(target_id)?);
+    }
+    if !map.contains_key(draft_id) {
+        map.insert(draft_id.to_string(), LoadedModel::load(draft_id)?);
+    }
+    let target = map.get(target_id).expect("just inserted");
+    let draft = map.get(draft_id).expect("just inserted");
+    base_mlx_core::speculative::check_compatible(target, draft)?;
+    Ok(f(target, draft))
 }
 
 async fn oneshot_response(
@@ -218,15 +356,29 @@ async fn oneshot_response(
     params: SamplingParams,
     max_tokens: u32,
     response_format: Option<Value>,
+    spec: Option<String>,
 ) -> Response {
     let model_id_for_payload = model_id.clone();
     let tools_slice = tools.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<_, base_mlx_core::Error> {
-        with_loaded(&state, &model_id, |loaded| {
-            let prompt = loaded.render_chat(&messages, tools_slice.as_deref());
-            let tokens = loaded.encode(&prompt)?;
-            loaded.generate(&tokens, &params, max_tokens, |_, _| {})
-        })?
+        match spec {
+            Some(draft_id) => with_target_and_draft(&state, &model_id, &draft_id, |target, draft| {
+                let prompt = target.render_chat(&messages, tools_slice.as_deref());
+                let tokens = target.encode(&prompt)?;
+                instrumented("oneshot-spec", || {
+                    base_mlx_core::speculative::generate(
+                        target, draft, &tokens, &params, max_tokens, |_, _| {},
+                    )
+                })
+            })?,
+            None => with_loaded(&state, &model_id, |loaded| {
+                let prompt = loaded.render_chat(&messages, tools_slice.as_deref());
+                let tokens = loaded.encode(&prompt)?;
+                instrumented("oneshot", || {
+                    loaded.generate(&tokens, &params, max_tokens, |_, _| {})
+                })
+            })?,
+        }
     })
     .await;
 
@@ -343,6 +495,7 @@ async fn stream_response(
     tools: Option<Vec<Value>>,
     params: SamplingParams,
     max_tokens: u32,
+    spec: Option<String>,
 ) -> Response {
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let created = SystemTime::now()
@@ -370,28 +523,17 @@ async fn stream_response(
     let model_id2 = model_id.clone();
     let tools_for_task = tools.clone();
     tokio::task::spawn_blocking(move || {
-        let res = with_loaded(&state, &model_id, |loaded| {
-            let prompt = loaded.render_chat(&messages, tools_for_task.as_deref());
-            let tokens = match loaded.encode(&prompt) {
-                Ok(t) => t,
-                Err(e) => {
-                    push_error(&tx, &e);
-                    return None;
-                }
-            };
+        // The streaming callback is identical between single-model and
+        // spec-dec paths — build it once and clone the captured channel
+        // into each closure.
+        let has_tools = tools_for_task.as_ref().is_some_and(|t| !t.is_empty());
+        let make_cb = || {
             let tx_for_cb = tx.clone();
             let id3 = id2.clone();
             let model_id3 = model_id2.clone();
-            // When tools are wired, the assistant may emit
-            // `<tool_call>...</tool_call>` markup. Streaming raw chars
-            // is ugly and breaks clients that don't expect the marker
-            // tokens in `delta.content`. So we buffer everything and
-            // emit nothing during generation — the final stop frame
-            // carries either the clean content or the tool_calls array.
-            let has_tools = tools_for_task.as_ref().is_some_and(|t| !t.is_empty());
-            let r = loaded.generate(&tokens, &params, max_tokens, move |piece, _| {
+            move |piece: &str, _tok: u32| {
                 if has_tools {
-                    return; // buffered, sent at end
+                    return;
                 }
                 let chunk = json!({
                     "id": id3,
@@ -405,9 +547,35 @@ async fn stream_response(
                     }],
                 });
                 let _ = tx_for_cb.send(Ok(Event::default().data(chunk.to_string())));
-            });
-            Some(r)
-        });
+            }
+        };
+
+        let res = match spec {
+            Some(draft_id) => with_target_and_draft(&state, &model_id, &draft_id, |target, draft| {
+                let prompt = target.render_chat(&messages, tools_for_task.as_deref());
+                let tokens = match target.encode(&prompt) {
+                    Ok(t) => t,
+                    Err(e) => { push_error(&tx, &e); return None; }
+                };
+                let cb = make_cb();
+                Some(instrumented("stream-spec", || {
+                    base_mlx_core::speculative::generate(
+                        target, draft, &tokens, &params, max_tokens, cb,
+                    )
+                }))
+            }),
+            None => with_loaded(&state, &model_id, |loaded| {
+                let prompt = loaded.render_chat(&messages, tools_for_task.as_deref());
+                let tokens = match loaded.encode(&prompt) {
+                    Ok(t) => t,
+                    Err(e) => { push_error(&tx, &e); return None; }
+                };
+                let cb = make_cb();
+                Some(instrumented("stream", || {
+                    loaded.generate(&tokens, &params, max_tokens, cb)
+                }))
+            }),
+        };
 
         match res {
             Ok(Some(Ok(gen))) => {

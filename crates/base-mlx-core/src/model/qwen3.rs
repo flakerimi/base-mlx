@@ -137,6 +137,29 @@ impl KvCache {
     pub fn is_initialized(&self) -> bool {
         !self.k.is_empty()
     }
+
+    /// Roll the cache back to the first `target_seq_len` positions.
+    /// No-op if already at or below that length. Used by speculative
+    /// decoding when the target rejects some draft tokens: both caches
+    /// processed K positions, we keep the accepted prefix and drop the
+    /// rest so the next iteration's verify input lines up.
+    ///
+    /// Each layer's k/v has shape `[kv_heads, seq, head_dim]`; we slice
+    /// axis 1 to `[..target_seq_len]`. mlx-rs's slice is functional —
+    /// it returns a new array sharing the underlying buffer, so this is
+    /// cheap (no copy). Old views drop when the Vec slot is overwritten.
+    pub fn truncate(&mut self, target_seq_len: usize) {
+        if target_seq_len >= self.seq_len {
+            return;
+        }
+        let t = target_seq_len as i32;
+        for (k, v) in self.k.iter_mut().zip(self.v.iter_mut()) {
+            // k/v shape: [kv_heads, seq, head_dim]. Slice axis 1 → [.., 0..t, ..].
+            *k = k.index((.., 0..t, ..));
+            *v = v.index((.., 0..t, ..));
+        }
+        self.seq_len = target_seq_len;
+    }
 }
 
 #[derive(Debug)]
@@ -244,6 +267,20 @@ impl Qwen3 {
     ///   - Subsequent calls: pass *only the new tokens* (typically one
     ///     during greedy decode) — cached K/V handle the rest.
     pub fn forward(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Array> {
+        let all = self.forward_internal(tokens, cache)?;
+        let seq_len = tokens.len() as i32;
+        Ok(all.index((seq_len - 1, ..)))
+    }
+
+    /// Like `forward`, but returns logits at *every* input position.
+    /// Shape: `[seq_len, vocab_size]`. Used by speculative decoding's
+    /// verify step — we feed K candidate tokens at once and need each
+    /// position's logits to compare against the draft's proposals.
+    pub fn forward_multi(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Array> {
+        self.forward_internal(tokens, cache)
+    }
+
+    fn forward_internal(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Array> {
         let head_dim = self.cfg.per_head_dim() as i32;
         let n_heads = self.cfg.num_attention_heads as i32;
         let kv_heads = self.cfg.kv_heads() as i32;
@@ -259,15 +296,18 @@ impl Qwen3 {
         // [seq, hidden]
         let mut x = self.embed.lookup(&tok_arr)?;
 
-        // Mask:
-        //   - prefill with multi-token input (offset=0, seq_len>1): full
-        //     causal [seq, seq] mask.
-        //   - single-token decode (seq_len==1): no mask needed; the one
-        //     query attends to every cached key (and itself).
-        //   - extending multi-token chunks against an existing cache is
-        //     also possible but rare — skip until we need it.
+        // Mask. Three regimes:
+        //   - single-token decode (seq_len==1): no mask needed.
+        //   - prefill on empty cache (offset==0, seq_len>1): square causal
+        //     [seq, seq] mask.
+        //   - multi-token forward on a non-empty cache (offset>0, seq_len>1):
+        //     non-square [seq, offset+seq] mask. The first `offset` columns
+        //     are 0 (each new query attends freely to all cached keys); the
+        //     trailing `seq` columns are causal-triangular among the new
+        //     tokens. This regime is hit by speculative decoding's verify
+        //     step, where target ingests K candidate tokens after prefill.
         let mask = if seq_len > 1 {
-            Some(causal_mask(seq_len, x.dtype())?)
+            Some(causal_mask_offset(seq_len, offset, x.dtype())?)
         } else {
             None
         };
@@ -336,20 +376,78 @@ impl Qwen3 {
             let k = mlx_rs::fast::rope(&k, head_dim, false, self.cfg.rope_theta, 1.0, offset, None)
                 .map_err(emap)?;
 
-            // Extend or seed the per-layer K/V cache. Concat each step is
-            // O(N) per layer; LM Studio uses in-place slice writes but
-            // mlx-rs's try_index_mut doesn't optimize to in-place when
-            // it can't prove refcount=1, so we eat the concat cost.
+            // Extend or seed the per-layer K/V cache via in-place
+            // slice_update against a pre-allocated [kv_heads, KV_PREALLOC,
+            // head_dim] buffer. MLX's runtime planner reuses the input
+            // buffer when its refcount is 1 — which is the case right
+            // after we reassign `cache.k[li]` and the prior SDPA view has
+            // dropped. Net effect: zero allocation per decode step, no
+            // O(N) concat, no fragmentation. The per-step cost stops
+            // growing with context length.
+            let new_end = offset + seq_len;
+            if new_end > KV_PREALLOC {
+                return Err(Error::Inference(format!(
+                    "KV cache exhausted: requested {new_end} positions, max {KV_PREALLOC}"
+                )));
+            }
+            let kv_heads_dim = kv_heads;
+            let head_dim_v = head_dim;
             let (k_cached, v_cached) = if extending {
-                let kk = mlx_rs::ops::concatenate_axis(&[&cache.k[li], &k], 1).map_err(emap)?;
-                let vv = mlx_rs::ops::concatenate_axis(&[&cache.v[li], &v], 1).map_err(emap)?;
-                cache.k[li] = kk.clone();
-                cache.v[li] = vv.clone();
-                (kk, vv)
+                let kk = crate::mlx_ext::slice_update(
+                    &cache.k[li],
+                    &k,
+                    &[0, offset, 0],
+                    &[kv_heads_dim, new_end, head_dim_v],
+                    &[1, 1, 1],
+                )
+                .map_err(|e| Error::Inference(e))?;
+                let vv = crate::mlx_ext::slice_update(
+                    &cache.v[li],
+                    &v,
+                    &[0, offset, 0],
+                    &[kv_heads_dim, new_end, head_dim_v],
+                    &[1, 1, 1],
+                )
+                .map_err(|e| Error::Inference(e))?;
+                cache.k[li] = kk;
+                cache.v[li] = vv;
+                // Read view of the valid portion. The slice op is a
+                // metadata-only view; SDPA reads through it without
+                // copying. View drops at end of layer iteration so the
+                // next step's slice_update sees refcount=1 on the cache.
+                let kv = cache.k[li].index((.., 0..new_end, ..));
+                let vv_view = cache.v[li].index((.., 0..new_end, ..));
+                (kv, vv_view)
             } else {
-                cache.k.push(k.clone());
-                cache.v.push(v.clone());
-                (k, v)
+                // First call this conversation: seed the cache by writing
+                // the prefill into a fresh zero buffer of [kv_heads,
+                // KV_PREALLOC, head_dim]. Buffer is allocated once and
+                // reused for the whole conversation.
+                let zeros_k = mlx_rs::ops::zeros_dtype(&[kv_heads_dim, KV_PREALLOC, head_dim_v], k.dtype())
+                    .map_err(emap)?;
+                let zeros_v = mlx_rs::ops::zeros_dtype(&[kv_heads_dim, KV_PREALLOC, head_dim_v], v.dtype())
+                    .map_err(emap)?;
+                let kk = crate::mlx_ext::slice_update(
+                    &zeros_k,
+                    &k,
+                    &[0, 0, 0],
+                    &[kv_heads_dim, seq_len, head_dim_v],
+                    &[1, 1, 1],
+                )
+                .map_err(|e| Error::Inference(e))?;
+                let vv = crate::mlx_ext::slice_update(
+                    &zeros_v,
+                    &v,
+                    &[0, 0, 0],
+                    &[kv_heads_dim, seq_len, head_dim_v],
+                    &[1, 1, 1],
+                )
+                .map_err(|e| Error::Inference(e))?;
+                cache.k.push(kk);
+                cache.v.push(vv);
+                let kv = cache.k[li].index((.., 0..seq_len, ..));
+                let vv_view = cache.v[li].index((.., 0..seq_len, ..));
+                (kv, vv_view)
             };
 
             // MLX SDPA handles GQA natively — q has n_heads, k/v have
@@ -411,8 +509,8 @@ impl Qwen3 {
         };
 
         cache.seq_len += seq_len as usize;
-        // Last token's logits: [vocab].
-        Ok(logits.index((seq_len - 1, ..)))
+        // Full [seq, vocab] tensor — callers slice as needed.
+        Ok(logits)
     }
 }
 
@@ -471,17 +569,24 @@ fn read_all_shards(dir: &Path) -> Result<HashMap<String, Array>> {
     Ok(out)
 }
 
-fn causal_mask(seq_len: i32, dtype: Dtype) -> Result<Array> {
-    // Build a [seq, seq] mask with 0 on/below diag, -1e9 above.
-    let ones = Array::ones::<f32>(&[seq_len, seq_len]).map_err(emap)?;
-    let lower = mlx_rs::ops::tril(&ones, 0).map_err(emap)?;
-    let neg_inf = Array::full::<f32>(&[seq_len, seq_len], &Array::from_f32(-1.0e9)).map_err(emap)?;
-    // mask = lower==1 ? 0 : -1e9
-    let zeros = Array::zeros::<f32>(&[seq_len, seq_len]).map_err(emap)?;
-    let cond = lower.eq(&Array::from_f32(1.0)).map_err(emap)?;
+fn causal_mask_offset(seq_len: i32, offset: i32, dtype: Dtype) -> Result<Array> {
+    // Build a [seq, offset+seq] mask. The first `offset` columns are 0
+    // (each query attends freely to all cached keys); the trailing `seq`
+    // columns are causal-triangular among the new tokens. Reduces to the
+    // square [seq, seq] case when offset == 0.
+    //
+    // Trick: `tril(ones, k=offset)` over a [seq, offset+seq] grid sets 1
+    // on/below the shifted diagonal — i.e. exactly the cells we want
+    // unmasked. We then map 1→0 and 0→-1e9 for additive masking.
+    let k_len = offset + seq_len;
+    let ones = Array::ones::<f32>(&[seq_len, k_len]).map_err(emap)?;
+    let allowed = mlx_rs::ops::tril(&ones, offset).map_err(emap)?;
+    let zeros = Array::zeros::<f32>(&[seq_len, k_len]).map_err(emap)?;
+    let neg_inf = Array::full::<f32>(&[seq_len, k_len], &Array::from_f32(-1.0e9)).map_err(emap)?;
+    let cond = allowed.eq(&Array::from_f32(1.0)).map_err(emap)?;
     let m = mlx_rs::ops::r#where(&cond, &zeros, &neg_inf).map_err(emap)?;
     let m = m.as_dtype(dtype).map_err(emap)?;
-    // [seq, seq] → [1, 1, seq, seq] for broadcasting in SDPA.
+    // [seq, k_len] → [1, 1, seq, k_len] for broadcasting in SDPA.
     let m = m.expand_dims(0).map_err(emap)?.expand_dims(0).map_err(emap)?;
     Ok(m)
 }

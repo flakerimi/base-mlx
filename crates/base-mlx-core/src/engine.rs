@@ -36,13 +36,34 @@ impl LoadedModel {
         let cfg = ModelConfig::from_path(dir.join("config.json"))?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let model = Qwen3::load(&dir, cfg.clone())?;
-        Ok(Self {
+        let loaded = Self {
             id: id_or_repo.to_string(),
             repo,
             cfg,
             tokenizer,
             model,
-        })
+        };
+        loaded.warmup();
+        Ok(loaded)
+    }
+
+    /// One throwaway forward pass to compile the qkv/mlp kernels and
+    /// prime the Metal compute pipeline. Without this the first real
+    /// request pays the full compilation cost — measured at ~2x slower
+    /// than warm steady-state on Qwen3-4B.
+    fn warmup(&self) {
+        let mut cache = KvCache::new();
+        // Two BOS tokens: one prefill (multi-token path) + one decode
+        // step (single-token path). Both kernels are compiled separately
+        // by mlx::compile because their input shapes differ.
+        let bos: u32 = 151643; // <|endoftext|> — safe filler for Qwen3 family
+        if let Ok(logits) = self.model.forward(&[bos, bos], &mut cache) {
+            drop(logits);
+            if let Ok(logits) = self.model.forward(&[bos], &mut cache) {
+                drop(logits);
+            }
+        }
+        cache.reset();
     }
 
     /// Render a chat with this model's template. `tools` is the raw
