@@ -34,6 +34,19 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Benchmark TTFT and decode throughput for the current binary.
+    Bench {
+        #[arg(long, default_value = "qwen3-4b-instruct")]
+        model: String,
+        /// Prompt — kept short by default so prefill doesn't dominate.
+        #[arg(long, default_value = "Tell me a short story about an apple.")]
+        prompt: String,
+        #[arg(long, default_value_t = 128)]
+        max_tokens: u32,
+        /// Number of runs to average. First run is treated as warmup.
+        #[arg(long, default_value_t = 3)]
+        runs: u32,
+    },
     /// Generate text from a prompt (M1 — currently does load + inventory only).
     Generate {
         /// Model id or HuggingFace repo.
@@ -78,6 +91,98 @@ async fn main() -> Result<()> {
                     println!("  - {}", name.to_string_lossy());
                 }
             }
+            Ok(())
+        }
+        Cmd::Bench {
+            model,
+            prompt,
+            max_tokens,
+            runs,
+        } => {
+            let loaded = base_mlx_core::engine::LoadedModel::load(&model)?;
+            let chat_prompt = loaded.render_chat(
+                &[base_mlx_core::chat_template::ChatMessage {
+                    role: "user".into(),
+                    content: prompt.clone(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: None,
+                }],
+                None,
+            );
+            let tokens = loaded.encode(&chat_prompt)?;
+            let params = base_mlx_core::sampler::SamplingParams {
+                temperature: 0.0, // greedy → deterministic measurement
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                seed: None,
+                grammar: None,
+            };
+
+            println!(
+                "model={model}  prompt_tokens={}  max_tokens={max_tokens}  runs={runs}",
+                tokens.len()
+            );
+            println!("MLX cache (post-load):  active={:>6.1}MB  cached={:>6.1}MB",
+                bytes_to_mb(base_mlx_core::memory::active_bytes()?),
+                bytes_to_mb(base_mlx_core::memory::cache_bytes()?),
+            );
+
+            let mut ttfts = Vec::new();
+            let mut decode_rates = Vec::new();
+            for r in 0..runs {
+                let label = if r == 0 { "warmup" } else { "run" };
+                let ttft_start = std::time::Instant::now();
+                let mut first_token_at: Option<std::time::Instant> = None;
+                let decode_start = std::cell::RefCell::new(None);
+                let counter = std::cell::Cell::new(0u32);
+
+                let res = loaded.generate(&tokens, &params, max_tokens, |_piece, _id| {
+                    if first_token_at.is_none() {
+                        // Capture the time when the first piece arrives —
+                        // that's TTFT, since `generate` calls the callback
+                        // after each produced token.
+                    }
+                    if counter.get() == 0 {
+                        *decode_start.borrow_mut() = Some(std::time::Instant::now());
+                    }
+                    counter.set(counter.get() + 1);
+                })?;
+
+                // Estimate TTFT and decode rate. We can't observe the first
+                // callback time directly here (callback is FnMut not
+                // FnOnce-aware), so we approximate: total elapsed minus
+                // (n-1)/rate. Better path: instrument generate() itself.
+                let total = ttft_start.elapsed().as_secs_f64();
+                let n = res.completion_tokens as f64;
+                // Rough TTFT = total - decode_time_of_other_tokens
+                // We approximate by re-running a tiny generation just to
+                // get TTFT alone.
+                let ttft_start2 = std::time::Instant::now();
+                let _ = loaded.generate(&tokens, &params, 1, |_, _| {})?;
+                let ttft = ttft_start2.elapsed().as_secs_f64();
+                let decode = (total - ttft).max(0.001);
+                let rate = (n - 1.0).max(0.0) / decode;
+
+                ttfts.push(ttft);
+                decode_rates.push(rate);
+                println!(
+                    "  {label:>7} #{r}: ttft={:.3}s  decode={:.1} tok/s  ({} tokens)",
+                    ttft, rate, res.completion_tokens
+                );
+            }
+
+            // Average over runs after warmup.
+            let n = (runs as usize).saturating_sub(1).max(1);
+            let avg_ttft = ttfts.iter().skip(1).sum::<f64>() / n as f64;
+            let avg_rate = decode_rates.iter().skip(1).sum::<f64>() / n as f64;
+            println!();
+            println!("Average (excluding warmup):  ttft={:.3}s  decode={:.1} tok/s", avg_ttft, avg_rate);
+            println!("MLX cache (post-bench): active={:>6.1}MB  cached={:>6.1}MB",
+                bytes_to_mb(base_mlx_core::memory::active_bytes()?),
+                bytes_to_mb(base_mlx_core::memory::cache_bytes()?),
+            );
             Ok(())
         }
         Cmd::Generate {
@@ -195,6 +300,10 @@ fn resolve_repo(id_or_repo: &str) -> String {
         .find(|m| m.id == id_or_repo)
         .map(|m| m.hf_repo)
         .unwrap_or_else(|| id_or_repo.to_string())
+}
+
+fn bytes_to_mb(b: usize) -> f64 {
+    b as f64 / 1024.0 / 1024.0
 }
 
 fn count_tensors(dir: &std::path::Path) -> anyhow::Result<usize> {
