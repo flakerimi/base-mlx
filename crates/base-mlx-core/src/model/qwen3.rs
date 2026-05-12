@@ -284,8 +284,8 @@ impl Qwen3 {
         // MLX op fusion: compile cache hits per shape × function-pointer
         // identity, so each layer's call lands on the same fused graph
         // after the first.
-        let mut compiled_qkv = compile(qkv_block, false);
-        let mut compiled_mlp = compile(mlp_block, false);
+        let mut compiled_qkv = compile(qkv_block, true);
+        let mut compiled_mlp = compile(mlp_block, true);
 
         for (li, layer) in self.layers.iter().enumerate() {
             // ── Attention: fused input_norm + q/k/v projections ──
