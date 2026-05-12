@@ -236,6 +236,7 @@ dependencies = [
  "hf-hub",
  "indexmap",
  "mlx-rs",
+ "mlx-sys",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "safetensors",

@@ -11,6 +11,7 @@
 pub mod chat_template;
 pub mod engine;
 pub mod error;
+pub mod memory;
 pub mod model;
 pub mod pull;
 pub mod registry;

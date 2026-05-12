@@ -23,6 +23,13 @@ impl Default for ServerConfig {
 }
 
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
+    // Cap MLX's Metal free-list at 1 GiB. The default is unbounded and
+    // grows unbounded too (one buffer per unique tensor shape) — during
+    // long decode runs the process RSS climbs past 20 GB without this.
+    if let Err(e) = base_mlx_core::memory::set_cache_limit(1 << 30) {
+        tracing::warn!(error = %e, "failed to cap MLX cache");
+    }
+
     let state: AppState = AppInner::new();
 
     let app = Router::new()

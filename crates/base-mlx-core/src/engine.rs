@@ -104,6 +104,14 @@ impl LoadedModel {
         } else {
             finish.to_string()
         };
+
+        // Release the KV cache and ask MLX to return its Metal free
+        // list to the OS. Without this, decoding accumulates one buffer
+        // per unique cache shape and the free-list grows unbounded.
+        cache.reset();
+        drop(logits);
+        let _ = crate::memory::clear_cache();
+
         Ok(GenerationResult {
             text: clean,
             prompt_tokens: prompt_tokens.len() as u32,
