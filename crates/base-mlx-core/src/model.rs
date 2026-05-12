@@ -5,6 +5,7 @@
 //! architecture from the safetensors config + weights.
 
 pub mod config;
+pub mod kernels;
 pub mod qwen3;
 
 pub use config::{ModelConfig, QuantConfig};

@@ -134,16 +134,10 @@ async fn main() -> Result<()> {
             for r in 0..runs {
                 let label = if r == 0 { "warmup" } else { "run" };
                 let ttft_start = std::time::Instant::now();
-                let mut first_token_at: Option<std::time::Instant> = None;
                 let decode_start = std::cell::RefCell::new(None);
                 let counter = std::cell::Cell::new(0u32);
 
                 let res = loaded.generate(&tokens, &params, max_tokens, |_piece, _id| {
-                    if first_token_at.is_none() {
-                        // Capture the time when the first piece arrives —
-                        // that's TTFT, since `generate` calls the callback
-                        // after each produced token.
-                    }
                     if counter.get() == 0 {
                         *decode_start.borrow_mut() = Some(std::time::Instant::now());
                     }

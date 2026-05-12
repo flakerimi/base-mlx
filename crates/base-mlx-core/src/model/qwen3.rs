@@ -4,10 +4,13 @@
 //! Correctness first; cache + speculative decoding land as separate
 //! milestones once a single forward pass produces sensible logits.
 
+use super::kernels::{mlp_block, qkv_block};
 use super::ModelConfig;
 use crate::{Error, Result};
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -272,13 +275,31 @@ impl Qwen3 {
             )));
         }
 
-        for (li, layer) in self.layers.iter().enumerate() {
-            // ── Attention ──
-            let h = layer.input_norm.forward(&x)?;
+        // MLX op fusion: compile cache hits per shape × function-pointer
+        // identity, so each layer's call lands on the same fused graph
+        // after the first.
+        let mut compiled_qkv = compile(qkv_block, false);
+        let mut compiled_mlp = compile(mlp_block, false);
 
-            let q = layer.q_proj.forward(&h)?; // [seq, n_heads*head_dim]
-            let k = layer.k_proj.forward(&h)?; // [seq, kv_heads*head_dim]
-            let v = layer.v_proj.forward(&h)?;
+        for (li, layer) in self.layers.iter().enumerate() {
+            // ── Attention: fused input_norm + q/k/v projections ──
+            let qkv_inputs = [
+                x.clone(),
+                layer.input_norm.weight.clone(),
+                layer.q_proj.weight.clone(),
+                layer.q_proj.scales.clone(),
+                layer.q_proj.biases.clone(),
+                layer.k_proj.weight.clone(),
+                layer.k_proj.scales.clone(),
+                layer.k_proj.biases.clone(),
+                layer.v_proj.weight.clone(),
+                layer.v_proj.scales.clone(),
+                layer.v_proj.biases.clone(),
+            ];
+            let qkv = compiled_qkv(&qkv_inputs).map_err(emap)?;
+            let q = qkv[0].clone();
+            let k = qkv[1].clone();
+            let v = qkv[2].clone();
 
             // Reshape to [seq, n_heads, head_dim] and apply per-head RMSNorm
             // (Qwen3-specific: applied before RoPE).
@@ -355,13 +376,23 @@ impl Qwen3 {
             let attn = layer.o_proj.forward(&attn)?;
             x = &x + &attn;
 
-            // ── MLP (SwiGLU) ──
-            let h = layer.post_attn_norm.forward(&x)?;
-            let gate = layer.gate_proj.forward(&h)?;
-            let up = layer.up_proj.forward(&h)?;
-            let gate = mlx_rs::nn::silu(&gate).map_err(emap)?;
-            let down = layer.down_proj.forward(&(&gate * &up))?;
-            x = &x + &down;
+            // MLP fused: post_norm → gate/up_proj → silu·up → down_proj
+            let mlp_inputs = [
+                x.clone(),
+                layer.post_attn_norm.weight.clone(),
+                layer.gate_proj.weight.clone(),
+                layer.gate_proj.scales.clone(),
+                layer.gate_proj.biases.clone(),
+                layer.up_proj.weight.clone(),
+                layer.up_proj.scales.clone(),
+                layer.up_proj.biases.clone(),
+                layer.down_proj.weight.clone(),
+                layer.down_proj.scales.clone(),
+                layer.down_proj.biases.clone(),
+            ];
+            let mlp_out = compiled_mlp(&mlp_inputs).map_err(emap)?;
+            x = &x + &mlp_out[0];
+            let _ = li;
         }
 
         let x = self.norm.forward(&x)?;
