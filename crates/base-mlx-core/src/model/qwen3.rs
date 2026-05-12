@@ -352,13 +352,14 @@ impl Qwen3 {
                 (k, v)
             };
 
-            let k = mlx_rs::ops::repeat_axis::<i32>(k_cached, repeats, 0).map_err(emap)?;
-            let v = mlx_rs::ops::repeat_axis::<i32>(v_cached, repeats, 0).map_err(emap)?;
-
-            // SDPA expects [batch, heads, seq, dim] — add a unit batch.
+            // MLX SDPA handles GQA natively — q has n_heads, k/v have
+            // kv_heads; the kernel handles the implicit head replication
+            // without us materializing an expanded tensor. Avoids the
+            // per-step kv-expansion copy.
+            let _ = repeats;
             let q = q.expand_dims(0).map_err(emap)?;
-            let k = k.expand_dims(0).map_err(emap)?;
-            let v = v.expand_dims(0).map_err(emap)?;
+            let k = k_cached.expand_dims(0).map_err(emap)?;
+            let v = v_cached.expand_dims(0).map_err(emap)?;
 
             let attn = match &mask {
                 Some(m) => mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, m)
