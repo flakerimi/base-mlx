@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 base-mlx-core.workspace = true
 base-mlx-server.workspace = true
+safetensors.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

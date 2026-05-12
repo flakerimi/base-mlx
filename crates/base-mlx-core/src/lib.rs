@@ -10,6 +10,7 @@
 
 pub mod error;
 pub mod model;
+pub mod pull;
 pub mod registry;
 pub mod sampler;
 pub mod session;
