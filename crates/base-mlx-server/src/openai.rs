@@ -44,12 +44,12 @@ pub struct ChatRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct ErrorBody {
+pub struct ErrorBody {
     error: ErrorPayload,
 }
 
 #[derive(Debug, Serialize)]
-struct ErrorPayload {
+pub struct ErrorPayload {
     message: String,
     #[serde(rename = "type")]
     kind: &'static str,
