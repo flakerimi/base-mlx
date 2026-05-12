@@ -1,5 +1,7 @@
+use crate::state::{AppInner, AppState};
 use anyhow::Result;
 use axum::{
+    extract::State,
     routing::{get, post},
     Json, Router,
 };
@@ -21,6 +23,8 @@ impl Default for ServerConfig {
 }
 
 pub async fn serve(cfg: ServerConfig) -> Result<()> {
+    let state: AppState = AppInner::new();
+
     let app = Router::new()
         .route("/", get(root))
         .route("/v1/models", get(crate::openai::list_models))
@@ -28,7 +32,8 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
             "/v1/chat/completions",
             post(crate::openai::chat_completions),
         )
-        .route("/v1/embeddings", post(crate::openai::embeddings));
+        .route("/v1/embeddings", post(crate::openai::embeddings))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.addr).await?;
     tracing::info!(addr = %cfg.addr, "base-mlx serving");
@@ -36,7 +41,7 @@ pub async fn serve(cfg: ServerConfig) -> Result<()> {
     Ok(())
 }
 
-async fn root() -> Json<Value> {
+async fn root(State(_state): State<AppState>) -> Json<Value> {
     Json(json!({
         "name": "base-mlx",
         "version": env!("CARGO_PKG_VERSION"),

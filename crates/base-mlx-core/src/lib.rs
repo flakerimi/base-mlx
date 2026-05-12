@@ -8,6 +8,8 @@
 //! Public surface is intentionally small while the engine is in flux —
 //! everything graduates out of `internal` as it stabilizes.
 
+pub mod chat_template;
+pub mod engine;
 pub mod error;
 pub mod model;
 pub mod pull;

@@ -12,5 +12,6 @@
 
 pub mod app;
 pub mod openai;
+pub mod state;
 
 pub use app::{serve, ServerConfig};
