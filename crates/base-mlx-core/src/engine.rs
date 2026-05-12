@@ -3,7 +3,7 @@
 //! model_id; concurrent requests serialize through it (until we add
 //! continuous batching).
 
-use crate::chat_template::{qwen3_chat, ChatMessage};
+use crate::chat_template::{qwen3_chat, ChatMessage, ToolCall};
 use crate::model::{ModelConfig, Qwen3};
 use crate::model::qwen3::KvCache;
 use crate::pull;
@@ -45,9 +45,15 @@ impl LoadedModel {
         })
     }
 
-    /// Render a chat with this model's template.
-    pub fn render_chat(&self, msgs: &[ChatMessage]) -> String {
-        qwen3_chat(msgs)
+    /// Render a chat with this model's template. `tools` is the raw
+    /// OpenAI tools array (each entry is a `{type:"function",function:{...}}`
+    /// object); we hand it straight to the template.
+    pub fn render_chat(
+        &self,
+        msgs: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+    ) -> String {
+        qwen3_chat(msgs, tools)
     }
 
     /// Encode a rendered prompt to token ids.
@@ -89,11 +95,21 @@ impl LoadedModel {
             logits = self.model.forward(&[next], &mut cache)?;
         }
 
+        // Extract tool calls from the final text. If any are present we
+        // bubble them up via `finish_reason: "tool_calls"` per the
+        // OpenAI convention, and strip the markup from `text`.
+        let (clean, tool_calls) = crate::chat_template::extract_tool_calls(&text);
+        let finish_reason = if !tool_calls.is_empty() {
+            "tool_calls".to_string()
+        } else {
+            finish.to_string()
+        };
         Ok(GenerationResult {
-            text,
+            text: clean,
             prompt_tokens: prompt_tokens.len() as u32,
             completion_tokens: produced,
-            finish_reason: finish.into(),
+            finish_reason,
+            tool_calls,
         })
     }
 
@@ -173,6 +189,9 @@ pub struct GenerationResult {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub finish_reason: String,
+    /// Any tool calls extracted from the assistant output. When this is
+    /// non-empty `text` has them stripped.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 fn resolve_repo(id_or_repo: &str) -> String {

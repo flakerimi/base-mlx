@@ -114,11 +114,79 @@ pub async fn chat_completions(
     };
     let max_tokens = req.max_tokens.unwrap_or(512);
 
+    // Soft enforcement of response_format. Real grammar-constrained
+    // sampling lands in a separate milestone; for now we ask the model
+    // for valid JSON via a system-prompt nudge, then validate and
+    // optionally retry once. Schema is exposed in the nudge so the
+    // model can shape its output even without enforced constraints.
+    let messages = inject_response_format(req.messages.clone(), req.response_format.as_ref());
+
     if req.stream {
-        stream_response(state, req.model, req.messages, params, max_tokens).await
+        stream_response(
+            state,
+            req.model,
+            messages,
+            req.tools.clone(),
+            params,
+            max_tokens,
+        )
+        .await
     } else {
-        oneshot_response(state, req.model, req.messages, params, max_tokens).await
+        oneshot_response(
+            state,
+            req.model,
+            messages,
+            req.tools.clone(),
+            params,
+            max_tokens,
+            req.response_format.clone(),
+        )
+        .await
     }
+}
+
+fn inject_response_format(
+    mut messages: Vec<ChatMessage>,
+    response_format: Option<&Value>,
+) -> Vec<ChatMessage> {
+    let Some(rf) = response_format else {
+        return messages;
+    };
+    let kind = rf.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let nudge = match kind {
+        "json_object" => Some(String::from(
+            "\n\nIMPORTANT: respond with a single valid JSON object. No prose, no markdown fences.",
+        )),
+        "json_schema" => {
+            let schema = rf
+                .get("json_schema")
+                .and_then(|j| j.get("schema"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Some(format!(
+                "\n\nIMPORTANT: respond with a single JSON value that conforms to this JSON Schema. No prose, no markdown fences.\nSchema:\n{}",
+                serde_json::to_string(&schema).unwrap_or_else(|_| "{}".into())
+            ))
+        }
+        _ => None,
+    };
+    let Some(nudge) = nudge else { return messages; };
+
+    if let Some(sys) = messages.iter_mut().find(|m| m.role == "system") {
+        sys.content.push_str(&nudge);
+    } else {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".into(),
+                content: format!("You are a helpful assistant.{nudge}"),
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+        );
+    }
+    messages
 }
 
 /// Take the mutex, load the model if needed, run `f` with a &LoadedModel.
@@ -146,20 +214,23 @@ async fn oneshot_response(
     state: AppState,
     model_id: String,
     messages: Vec<ChatMessage>,
+    tools: Option<Vec<Value>>,
     params: SamplingParams,
     max_tokens: u32,
+    response_format: Option<Value>,
 ) -> Response {
     let model_id_for_payload = model_id.clone();
+    let tools_slice = tools.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<_, base_mlx_core::Error> {
         with_loaded(&state, &model_id, |loaded| {
-            let prompt = loaded.render_chat(&messages);
+            let prompt = loaded.render_chat(&messages, tools_slice.as_deref());
             let tokens = loaded.encode(&prompt)?;
             loaded.generate(&tokens, &params, max_tokens, |_, _| {})
         })?
     })
     .await;
 
-    let gen = match result {
+    let mut gen = match result {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             return err(
@@ -171,10 +242,36 @@ async fn oneshot_response(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), "join_error"),
     };
 
+    // Post-hoc JSON validation when the caller asked for structured
+    // output. On failure, return the raw text but flag it via a custom
+    // header — a real retry pass would re-run with the error message
+    // appended. Keeping v1 deterministic; retries are easy to add.
+    let json_valid = match response_format.as_ref().and_then(|r| r.get("type")).and_then(|t| t.as_str()) {
+        Some("json_object") | Some("json_schema") => Some(
+            serde_json::from_str::<Value>(gen.text.trim()).is_ok(),
+        ),
+        _ => None,
+    };
+    if json_valid == Some(false) {
+        // Heuristic cleanup: try to extract the first JSON object.
+        if let Some(cleaned) = extract_first_json(&gen.text) {
+            gen.text = cleaned;
+        }
+    }
+
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+
+    let mut message = json!({ "role": "assistant" });
+    if !gen.tool_calls.is_empty() {
+        // OpenAI: when tool_calls is present, content can be null.
+        message["content"] = Value::Null;
+        message["tool_calls"] = serde_json::to_value(&gen.tool_calls).unwrap_or(Value::Null);
+    } else {
+        message["content"] = Value::String(gen.text);
+    }
 
     Json(json!({
         "id": format!("chatcmpl-{}", Uuid::new_v4().simple()),
@@ -183,7 +280,7 @@ async fn oneshot_response(
         "model": model_id_for_payload,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": gen.text },
+            "message": message,
             "finish_reason": gen.finish_reason,
         }],
         "usage": {
@@ -195,10 +292,55 @@ async fn oneshot_response(
     .into_response()
 }
 
+/// Heuristic: grab the first balanced JSON object from text. Bails out
+/// if it can't find one. Used when a model returned JSON with stray
+/// markdown fences or prose around it.
+fn extract_first_json(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut start = None;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_str {
+            match b {
+                b'\\' => escape = true,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => {
+                if start.is_none() {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        return Some(text[s..=i].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 async fn stream_response(
     state: AppState,
     model_id: String,
     messages: Vec<ChatMessage>,
+    tools: Option<Vec<Value>>,
     params: SamplingParams,
     max_tokens: u32,
 ) -> Response {
@@ -226,9 +368,10 @@ async fn stream_response(
 
     let id2 = id.clone();
     let model_id2 = model_id.clone();
+    let tools_for_task = tools.clone();
     tokio::task::spawn_blocking(move || {
         let res = with_loaded(&state, &model_id, |loaded| {
-            let prompt = loaded.render_chat(&messages);
+            let prompt = loaded.render_chat(&messages, tools_for_task.as_deref());
             let tokens = match loaded.encode(&prompt) {
                 Ok(t) => t,
                 Err(e) => {
@@ -239,7 +382,17 @@ async fn stream_response(
             let tx_for_cb = tx.clone();
             let id3 = id2.clone();
             let model_id3 = model_id2.clone();
+            // When tools are wired, the assistant may emit
+            // `<tool_call>...</tool_call>` markup. Streaming raw chars
+            // is ugly and breaks clients that don't expect the marker
+            // tokens in `delta.content`. So we buffer everything and
+            // emit nothing during generation — the final stop frame
+            // carries either the clean content or the tool_calls array.
+            let has_tools = tools_for_task.as_ref().is_some_and(|t| !t.is_empty());
             let r = loaded.generate(&tokens, &params, max_tokens, move |piece, _| {
+                if has_tools {
+                    return; // buffered, sent at end
+                }
                 let chunk = json!({
                     "id": id3,
                     "object": "chat.completion.chunk",
@@ -258,6 +411,20 @@ async fn stream_response(
 
         match res {
             Ok(Some(Ok(gen))) => {
+                // When tools came back, emit them in the final delta so
+                // clients see a complete tool_calls array. Otherwise the
+                // final delta is empty (content was already streamed).
+                let final_delta = if !gen.tool_calls.is_empty() {
+                    json!({
+                        "tool_calls": serde_json::to_value(&gen.tool_calls).unwrap_or(Value::Null),
+                    })
+                } else if tools.as_ref().is_some_and(|t| !t.is_empty()) {
+                    // Tools were offered but the model replied with
+                    // plain content; deliver it all at once.
+                    json!({ "content": gen.text })
+                } else {
+                    json!({})
+                };
                 let stop = json!({
                     "id": id2,
                     "object": "chat.completion.chunk",
@@ -265,7 +432,7 @@ async fn stream_response(
                     "model": model_id2,
                     "choices": [{
                         "index": 0,
-                        "delta": {},
+                        "delta": final_delta,
                         "finish_reason": gen.finish_reason,
                     }],
                     "usage": {

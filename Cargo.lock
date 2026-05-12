@@ -245,6 +245,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
