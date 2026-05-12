@@ -105,12 +105,13 @@ impl LoadedModel {
             finish.to_string()
         };
 
-        // Release the KV cache and ask MLX to return its Metal free
-        // list to the OS. Without this, decoding accumulates one buffer
-        // per unique cache shape and the free-list grows unbounded.
+        // Release the KV cache (drops per-layer growing buffers held
+        // by this request). The MLX Metal free-list is bounded by
+        // `set_cache_limit` at server startup, so we *don't* clear it
+        // here — clearing wipes the compile cache too, forcing kernel
+        // recompilation on every subsequent request.
         cache.reset();
         drop(logits);
-        let _ = crate::memory::clear_cache();
 
         Ok(GenerationResult {
             text: clean,
