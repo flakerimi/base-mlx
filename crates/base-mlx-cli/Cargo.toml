@@ -13,6 +13,7 @@ path = "src/main.rs"
 base-mlx-core.workspace = true
 base-mlx-server.workspace = true
 safetensors.workspace = true
+mlx-rs.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

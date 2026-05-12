@@ -113,16 +113,36 @@ async fn main() -> Result<()> {
             let expected = base_mlx_core::model::Qwen3::expected_tensor_count(&cfg);
             let actual = count_tensors(&dir)?;
             println!("Tensors: expected {} | actual {}", expected, actual);
-            if expected != actual {
-                println!(
-                    "  ⚠️  mismatch — adjust expected_tensor_count or load logic before forward pass"
-                );
-            } else {
-                println!("  ✓  inventory matches expected layout");
-            }
+
+            // Tokenize the prompt.
+            let tok_path = dir.join("tokenizer.json");
+            let tok = base_mlx_core::tokenizer::Tokenizer::from_file(&tok_path)?;
+            let tokens = tok.encode(&prompt, false)?;
+            println!("Prompt tokens: {} ({:?}…)", tokens.len(), &tokens[..tokens.len().min(8)]);
+
+            // Load the model.
+            println!("Loading weights…");
+            let t0 = std::time::Instant::now();
+            let model = base_mlx_core::model::Qwen3::load(&dir, cfg)?;
+            println!("  loaded in {:.2}s", t0.elapsed().as_secs_f32());
+
+            // One forward pass — argmax of last-position logits.
+            println!("Running forward pass…");
+            let t1 = std::time::Instant::now();
+            let logits = model.forward(&tokens)?;
+            logits.eval().ok();
+            println!("  prefill in {:.2}s", t1.elapsed().as_secs_f32());
+
+            // 1-D logits → global argmax is fine here.
+            let argmax = mlx_rs::ops::indexing::argmax(&logits, false)
+                .map_err(|e| anyhow::anyhow!("argmax: {e}"))?;
+            argmax.eval().ok();
+            let next_id = argmax.as_slice::<u32>()[0];
+            let next_text = tok.decode(&[next_id], false)?;
+            println!("Next token (greedy): {} → {:?}", next_id, next_text);
             println!(
-                "\n(prompt={:?}, max_tokens={}) — forward pass not yet implemented; see ROADMAP M1",
-                prompt, max_tokens
+                "(decode loop / max_tokens={} not wired yet — that's the next milestone)",
+                max_tokens
             );
             Ok(())
         }

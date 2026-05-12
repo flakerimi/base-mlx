@@ -216,6 +216,7 @@ dependencies = [
  "base-mlx-server",
  "clap",
  "dirs",
+ "mlx-rs",
  "safetensors",
  "serde",
  "serde_json",
