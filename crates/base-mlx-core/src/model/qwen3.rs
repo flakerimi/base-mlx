@@ -72,8 +72,7 @@ impl QEmbedding {
         let w_rows = self.weight.index(tokens);
         let s_rows = self.scales.index(tokens);
         let b_rows = self.biases.index(tokens);
-        mlx_rs::ops::dequantize(&w_rows, &s_rows, &b_rows, self.group_size, self.bits)
-            .map_err(emap)
+        mlx_rs::ops::dequantize(&w_rows, &s_rows, &b_rows, self.group_size, self.bits).map_err(emap)
     }
 
     /// Use the same quantized table as an LM head (`tie_word_embeddings`).
@@ -171,6 +170,7 @@ pub struct Qwen3 {
     // When `tie_word_embeddings` is true we reuse `embed`; otherwise a
     // dedicated LM head lives here. Quantized either way for MLX models.
     lm_head: Option<QLinear>,
+    use_compiled_blocks: bool,
 }
 
 impl Qwen3 {
@@ -217,20 +217,50 @@ impl Qwen3 {
             let p = format!("model.layers.{i}");
             layers.push(Qwen3Layer {
                 input_norm: rms(&mut tensors, &format!("{p}.input_layernorm.weight"), eps)?,
-                q_proj: qlin(&mut tensors, &format!("{p}.self_attn.q_proj"), bits, group_size)?,
-                k_proj: qlin(&mut tensors, &format!("{p}.self_attn.k_proj"), bits, group_size)?,
-                v_proj: qlin(&mut tensors, &format!("{p}.self_attn.v_proj"), bits, group_size)?,
+                q_proj: qlin(
+                    &mut tensors,
+                    &format!("{p}.self_attn.q_proj"),
+                    bits,
+                    group_size,
+                )?,
+                k_proj: qlin(
+                    &mut tensors,
+                    &format!("{p}.self_attn.k_proj"),
+                    bits,
+                    group_size,
+                )?,
+                v_proj: qlin(
+                    &mut tensors,
+                    &format!("{p}.self_attn.v_proj"),
+                    bits,
+                    group_size,
+                )?,
                 q_norm: rms(&mut tensors, &format!("{p}.self_attn.q_norm.weight"), eps)?,
                 k_norm: rms(&mut tensors, &format!("{p}.self_attn.k_norm.weight"), eps)?,
-                o_proj: qlin(&mut tensors, &format!("{p}.self_attn.o_proj"), bits, group_size)?,
+                o_proj: qlin(
+                    &mut tensors,
+                    &format!("{p}.self_attn.o_proj"),
+                    bits,
+                    group_size,
+                )?,
                 post_attn_norm: rms(
                     &mut tensors,
                     &format!("{p}.post_attention_layernorm.weight"),
                     eps,
                 )?,
-                gate_proj: qlin(&mut tensors, &format!("{p}.mlp.gate_proj"), bits, group_size)?,
+                gate_proj: qlin(
+                    &mut tensors,
+                    &format!("{p}.mlp.gate_proj"),
+                    bits,
+                    group_size,
+                )?,
                 up_proj: qlin(&mut tensors, &format!("{p}.mlp.up_proj"), bits, group_size)?,
-                down_proj: qlin(&mut tensors, &format!("{p}.mlp.down_proj"), bits, group_size)?,
+                down_proj: qlin(
+                    &mut tensors,
+                    &format!("{p}.mlp.down_proj"),
+                    bits,
+                    group_size,
+                )?,
             });
         }
 
@@ -252,12 +282,15 @@ impl Qwen3 {
             )));
         }
 
+        let use_compiled_blocks = Self::default_use_compiled_blocks();
+
         Ok(Self {
             cfg,
             embed,
             layers,
             norm,
             lm_head,
+            use_compiled_blocks,
         })
     }
 
@@ -267,9 +300,7 @@ impl Qwen3 {
     ///   - Subsequent calls: pass *only the new tokens* (typically one
     ///     during greedy decode) — cached K/V handle the rest.
     pub fn forward(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Array> {
-        let all = self.forward_internal(tokens, cache)?;
-        let seq_len = tokens.len() as i32;
-        Ok(all.index((seq_len - 1, ..)))
+        self.forward_internal(tokens, cache, false)
     }
 
     /// Like `forward`, but returns logits at *every* input position.
@@ -277,10 +308,15 @@ impl Qwen3 {
     /// verify step — we feed K candidate tokens at once and need each
     /// position's logits to compare against the draft's proposals.
     pub fn forward_multi(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Array> {
-        self.forward_internal(tokens, cache)
+        self.forward_internal(tokens, cache, true)
     }
 
-    fn forward_internal(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Array> {
+    fn forward_internal(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        return_all_logits: bool,
+    ) -> Result<Array> {
         let head_dim = self.cfg.per_head_dim() as i32;
         let n_heads = self.cfg.num_attention_heads as i32;
         let kv_heads = self.cfg.kv_heads() as i32;
@@ -321,11 +357,14 @@ impl Qwen3 {
             )));
         }
 
-        // MLX op fusion: compile cache hits per shape × function-pointer
-        // identity, so each layer's call lands on the same fused graph
-        // after the first.
-        let mut compiled_qkv = compile(qkv_block, true);
-        let mut compiled_mlp = compile(mlp_block, true);
+        // The fused compile path looks attractive on paper, but current
+        // measurements show its fixed dispatch cost dominating both the
+        // 0.6B draft and the 4B target decode path. Default to eager
+        // blocks and keep compile as an env-controlled benchmark knob:
+        //   BASE_MLX_COMPILE=1 force compile
+        //   BASE_MLX_COMPILE=0 force eager
+        let mut compiled_qkv = self.use_compiled_blocks.then(|| compile(qkv_block, true));
+        let mut compiled_mlp = self.use_compiled_blocks.then(|| compile(mlp_block, true));
 
         for (li, layer) in self.layers.iter().enumerate() {
             // ── Attention: fused input_norm + q/k/v projections ──
@@ -342,22 +381,19 @@ impl Qwen3 {
                 layer.v_proj.scales.clone(),
                 layer.v_proj.biases.clone(),
             ];
-            let qkv = compiled_qkv(&qkv_inputs).map_err(emap)?;
+            let qkv = match compiled_qkv.as_mut() {
+                Some(f) => f(&qkv_inputs).map_err(emap)?,
+                None => qkv_block(&qkv_inputs),
+            };
             let q = qkv[0].clone();
             let k = qkv[1].clone();
             let v = qkv[2].clone();
 
             // Reshape to [seq, n_heads, head_dim] and apply per-head RMSNorm
             // (Qwen3-specific: applied before RoPE).
-            let q = q
-                .reshape(&[seq_len, n_heads, head_dim])
-                .map_err(emap)?;
-            let k = k
-                .reshape(&[seq_len, kv_heads, head_dim])
-                .map_err(emap)?;
-            let v = v
-                .reshape(&[seq_len, kv_heads, head_dim])
-                .map_err(emap)?;
+            let q = q.reshape(&[seq_len, n_heads, head_dim]).map_err(emap)?;
+            let k = k.reshape(&[seq_len, kv_heads, head_dim]).map_err(emap)?;
+            let v = v.reshape(&[seq_len, kv_heads, head_dim]).map_err(emap)?;
 
             let q = layer.q_norm.forward(&q)?;
             let k = layer.k_norm.forward(&k)?;
@@ -400,7 +436,7 @@ impl Qwen3 {
                     &[kv_heads_dim, new_end, head_dim_v],
                     &[1, 1, 1],
                 )
-                .map_err(|e| Error::Inference(e))?;
+                .map_err(Error::Inference)?;
                 let vv = crate::mlx_ext::slice_update(
                     &cache.v[li],
                     &v,
@@ -408,7 +444,7 @@ impl Qwen3 {
                     &[kv_heads_dim, new_end, head_dim_v],
                     &[1, 1, 1],
                 )
-                .map_err(|e| Error::Inference(e))?;
+                .map_err(Error::Inference)?;
                 cache.k[li] = kk;
                 cache.v[li] = vv;
                 // Read view of the valid portion. The slice op is a
@@ -423,10 +459,12 @@ impl Qwen3 {
                 // the prefill into a fresh zero buffer of [kv_heads,
                 // KV_PREALLOC, head_dim]. Buffer is allocated once and
                 // reused for the whole conversation.
-                let zeros_k = mlx_rs::ops::zeros_dtype(&[kv_heads_dim, KV_PREALLOC, head_dim_v], k.dtype())
-                    .map_err(emap)?;
-                let zeros_v = mlx_rs::ops::zeros_dtype(&[kv_heads_dim, KV_PREALLOC, head_dim_v], v.dtype())
-                    .map_err(emap)?;
+                let zeros_k =
+                    mlx_rs::ops::zeros_dtype(&[kv_heads_dim, KV_PREALLOC, head_dim_v], k.dtype())
+                        .map_err(emap)?;
+                let zeros_v =
+                    mlx_rs::ops::zeros_dtype(&[kv_heads_dim, KV_PREALLOC, head_dim_v], v.dtype())
+                        .map_err(emap)?;
                 let kk = crate::mlx_ext::slice_update(
                     &zeros_k,
                     &k,
@@ -434,7 +472,7 @@ impl Qwen3 {
                     &[kv_heads_dim, seq_len, head_dim_v],
                     &[1, 1, 1],
                 )
-                .map_err(|e| Error::Inference(e))?;
+                .map_err(Error::Inference)?;
                 let vv = crate::mlx_ext::slice_update(
                     &zeros_v,
                     &v,
@@ -442,7 +480,7 @@ impl Qwen3 {
                     &[kv_heads_dim, seq_len, head_dim_v],
                     &[1, 1, 1],
                 )
-                .map_err(|e| Error::Inference(e))?;
+                .map_err(Error::Inference)?;
                 cache.k.push(kk);
                 cache.v.push(vv);
                 let kv = cache.k[li].index((.., 0..seq_len, ..));
@@ -496,12 +534,20 @@ impl Qwen3 {
                 layer.down_proj.scales.clone(),
                 layer.down_proj.biases.clone(),
             ];
-            let mlp_out = compiled_mlp(&mlp_inputs).map_err(emap)?;
+            let mlp_out = match compiled_mlp.as_mut() {
+                Some(f) => f(&mlp_inputs).map_err(emap)?,
+                None => mlp_block(&mlp_inputs),
+            };
             x = &x + &mlp_out[0];
             let _ = li;
         }
 
         let x = self.norm.forward(&x)?;
+        let x = if return_all_logits {
+            x
+        } else {
+            x.index((seq_len - 1, ..)).expand_dims(0).map_err(emap)?
+        };
 
         let logits = match &self.lm_head {
             Some(head) => head.forward(&x)?,
@@ -509,8 +555,19 @@ impl Qwen3 {
         };
 
         cache.seq_len += seq_len as usize;
-        // Full [seq, vocab] tensor — callers slice as needed.
-        Ok(logits)
+        if return_all_logits {
+            Ok(logits)
+        } else {
+            Ok(logits.index((0, ..)))
+        }
+    }
+
+    fn default_use_compiled_blocks() -> bool {
+        match std::env::var("BASE_MLX_COMPILE").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") => false,
+            Some("1") | Some("true") | Some("on") => true,
+            _ => false,
+        }
     }
 }
 
@@ -583,10 +640,14 @@ fn causal_mask_offset(seq_len: i32, offset: i32, dtype: Dtype) -> Result<Array> 
     let allowed = mlx_rs::ops::tril(&ones, offset).map_err(emap)?;
     let zeros = Array::zeros::<f32>(&[seq_len, k_len]).map_err(emap)?;
     let neg_inf = Array::full::<f32>(&[seq_len, k_len], &Array::from_f32(-1.0e9)).map_err(emap)?;
-    let cond = allowed.eq(&Array::from_f32(1.0)).map_err(emap)?;
+    let cond = allowed.eq(Array::from_f32(1.0)).map_err(emap)?;
     let m = mlx_rs::ops::r#where(&cond, &zeros, &neg_inf).map_err(emap)?;
     let m = m.as_dtype(dtype).map_err(emap)?;
     // [seq, k_len] → [1, 1, seq, k_len] for broadcasting in SDPA.
-    let m = m.expand_dims(0).map_err(emap)?.expand_dims(0).map_err(emap)?;
+    let m = m
+        .expand_dims(0)
+        .map_err(emap)?
+        .expand_dims(0)
+        .map_err(emap)?;
     Ok(m)
 }

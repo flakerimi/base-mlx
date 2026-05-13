@@ -130,6 +130,84 @@ pub fn qwen3_chat(messages: &[ChatMessage], tools: Option<&[Value]>) -> String {
     out
 }
 
+/// Minimal Gemma 4 text chat template for plain chat generation.
+pub fn gemma4_chat(messages: &[ChatMessage], _tools: Option<&[Value]>) -> String {
+    let mut out = String::from("<bos>");
+    for m in messages {
+        match m.role.as_str() {
+            "system" | "developer" => {
+                out.push_str("<|turn>user\n");
+                out.push_str(m.content.trim());
+                out.push_str("<turn|>\n");
+            }
+            "user" => {
+                out.push_str("<|turn>user\n");
+                out.push_str(m.content.trim());
+                out.push_str("<turn|>\n");
+            }
+            "assistant" => {
+                out.push_str("<|turn>model\n");
+                out.push_str(m.content.trim());
+                out.push_str("<turn|>\n");
+            }
+            "tool" => {
+                out.push_str("<|turn>tool\n");
+                out.push_str(m.content.trim());
+                out.push_str("<turn|>\n");
+            }
+            other => {
+                out.push_str("<|turn>user\n[");
+                out.push_str(other);
+                out.push_str("] ");
+                out.push_str(m.content.trim());
+                out.push_str("<turn|>\n");
+            }
+        }
+    }
+    out.push_str("<|turn>model\n");
+    out
+}
+
+/// Minimal Granite chat template. The full template supports tools and
+/// documents; this covers the plain chat path we use for benchmarking and
+/// OpenAI-compatible `/chat/completions`.
+pub fn granite_chat(messages: &[ChatMessage], _tools: Option<&[Value]>) -> String {
+    let mut out = String::new();
+    for m in messages {
+        match m.role.as_str() {
+            "system" | "developer" => {
+                out.push_str("<|start_of_role|>system<|end_of_role|>");
+                out.push_str(m.content.trim());
+                out.push_str("<|end_of_text|>\n");
+            }
+            "user" => {
+                out.push_str("<|start_of_role|>user<|end_of_role|>");
+                out.push_str(m.content.trim());
+                out.push_str("<|end_of_text|>\n");
+            }
+            "assistant" => {
+                out.push_str("<|start_of_role|>assistant<|end_of_role|>");
+                out.push_str(m.content.trim());
+                out.push_str("<|end_of_text|>\n");
+            }
+            "tool" => {
+                out.push_str("<|start_of_role|>user<|end_of_role|>\n<tool_response>\n");
+                out.push_str(m.content.trim());
+                out.push_str("\n</tool_response><|end_of_text|>\n");
+            }
+            other => {
+                out.push_str("<|start_of_role|>user<|end_of_role|>[");
+                out.push_str(other);
+                out.push_str("] ");
+                out.push_str(m.content.trim());
+                out.push_str("<|end_of_text|>\n");
+            }
+        }
+    }
+    out.push_str("<|start_of_role|>assistant<|end_of_role|>");
+    out
+}
+
 /// Scan generated text for `<tool_call>...</tool_call>` blocks.
 /// Returns `(plain_text_with_tool_calls_stripped, tool_calls)`.
 ///

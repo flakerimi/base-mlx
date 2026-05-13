@@ -28,3 +28,50 @@ impl Tokenizer {
             .map_err(|e| Error::Tokenizer(e.to_string()))
     }
 }
+
+#[derive(Debug, Default)]
+pub struct Utf8TokenDecoder {
+    pending: Vec<u32>,
+    text: String,
+}
+
+impl Utf8TokenDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push<F: FnMut(&str, u32)>(
+        &mut self,
+        tokenizer: &Tokenizer,
+        token_id: u32,
+        on_piece: &mut F,
+    ) -> Result<()> {
+        self.pending.push(token_id);
+        let decoded = tokenizer.decode(&self.pending, false)?;
+        if decoded.ends_with('\u{FFFD}') {
+            return Ok(());
+        }
+        if !decoded.is_empty() {
+            on_piece(&decoded, token_id);
+            self.text.push_str(&decoded);
+        }
+        self.pending.clear();
+        Ok(())
+    }
+
+    pub fn finish<F: FnMut(&str, u32)>(
+        mut self,
+        tokenizer: &Tokenizer,
+        on_piece: &mut F,
+    ) -> Result<String> {
+        if !self.pending.is_empty() {
+            let decoded = tokenizer.decode(&self.pending, false)?;
+            if !decoded.contains('\u{FFFD}') {
+                on_piece(&decoded, 0);
+                self.text.push_str(&decoded);
+            }
+            self.pending.clear();
+        }
+        Ok(self.text)
+    }
+}

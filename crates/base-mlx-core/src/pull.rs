@@ -13,7 +13,9 @@
 //! Cache layout: `<cache>/base-mlx/models/<owner>--<repo>/`.
 
 use crate::Result;
+use futures::StreamExt;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
 use crate::registry::cache_dir;
@@ -34,16 +36,78 @@ pub fn search_dirs() -> Vec<PathBuf> {
 /// Strict exact-path lookup — used for catalog repo strings where a
 /// fuzzy hit on a different model would be a lie.
 pub fn find_local_exact(hf_repo: &str) -> Option<PathBuf> {
+    if let Some(dir) = find_local_exact_repo(hf_repo) {
+        return Some(dir);
+    }
+
+    for repo in lmstudio_hub_sources(hf_repo) {
+        if let Some(dir) = find_local_exact_repo(&repo) {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+fn find_local_exact_repo(hf_repo: &str) -> Option<PathBuf> {
     let mangled = hf_repo.replace('/', "--");
     let (owner, name) = hf_repo.split_once('/').unwrap_or((hf_repo, hf_repo));
     for base in search_dirs() {
         for candidate in [base.join(&mangled), base.join(owner).join(name)] {
-            if candidate.join("config.json").exists() {
+            if is_model_dir(&candidate) {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+fn lmstudio_hub_sources(model_id: &str) -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let (owner, name) = model_id.split_once('/').unwrap_or(("", model_id));
+    let manifest = home
+        .join(".lmstudio")
+        .join("hub")
+        .join("models")
+        .join(owner)
+        .join(name)
+        .join("manifest.json");
+    let Ok(raw) = std::fs::read_to_string(manifest) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+
+    let mut repos = Vec::new();
+    for source in json
+        .get("dependencies")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|dep| dep.get("purpose").and_then(|v| v.as_str()) == Some("baseModel"))
+        .filter_map(|dep| dep.get("sources").and_then(|v| v.as_array()))
+        .flatten()
+    {
+        let Some(user) = source.get("user").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(repo) = source.get("repo").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        repos.push(format!("{user}/{repo}"));
+    }
+    repos.sort_by_key(|repo| {
+        let lower = repo.to_ascii_lowercase();
+        (
+            !lower.contains("mlx"),
+            !lower.contains("4bit"),
+            !lower.contains("8bit"),
+            lower,
+        )
+    });
+    repos
 }
 
 /// Look for a model on disk. Tries, in order:
@@ -58,11 +122,8 @@ pub fn find_local(query: &str) -> Option<PathBuf> {
 
     // 1. Exact paths.
     for base in search_dirs() {
-        for candidate in [
-            base.join(&mangled),
-            base.join(owner).join(name),
-        ] {
-            if candidate.join("config.json").exists() {
+        for candidate in [base.join(&mangled), base.join(owner).join(name)] {
+            if is_model_dir(&candidate) {
                 return Some(candidate);
             }
         }
@@ -118,14 +179,14 @@ fn scan_model_dirs(root: &Path) -> Vec<PathBuf> {
         if !p.is_dir() {
             continue;
         }
-        if p.join("config.json").exists() {
+        if is_model_dir(&p) {
             out.push(p);
         } else {
             // Recurse one level (LM Studio: <owner>/<name>/config.json).
             if let Ok(inner) = std::fs::read_dir(&p) {
                 for ie in inner.flatten() {
                     let ip = ie.path();
-                    if ip.is_dir() && ip.join("config.json").exists() {
+                    if ip.is_dir() && is_model_dir(&ip) {
                         out.push(ip);
                     }
                 }
@@ -133,6 +194,16 @@ fn scan_model_dirs(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn is_model_dir(dir: &Path) -> bool {
+    dir.join("config.json").exists()
+        && std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
 }
 
 /// Crude scoring: number of characters in `query` that appear in
@@ -197,9 +268,10 @@ pub struct PullReport {
 /// `model.safetensors` (single-file) or every shard listed in
 /// `model.safetensors.index.json` (sharded).
 pub async fn pull(hf_repo: &str) -> Result<PullReport> {
-    // Short-circuit if a complete copy already exists locally — saves
-    // pulling 2 GB+ when LM Studio (or a previous run) already has it.
-    if let Some(dir) = find_local(hf_repo) {
+    // Short-circuit only on an exact repo hit. Fuzzy lookup is useful
+    // for user-facing local names, but a pull for `Qwen3-0.6B` must not
+    // silently resolve to an existing `Qwen3-4B` directory.
+    if let Some(dir) = find_local_exact(hf_repo) {
         info!(dir = %dir.display(), "found existing local copy; skipping download");
         let files: Vec<_> = std::fs::read_dir(&dir)
             .ok()
@@ -214,8 +286,7 @@ pub async fn pull(hf_repo: &str) -> Result<PullReport> {
         });
     }
 
-    let api = hf_hub::api::tokio::Api::new()
-        .map_err(|e| crate::Error::ModelLoad(e.to_string()))?;
+    let api = hf_hub::api::tokio::Api::new().map_err(|e| crate::Error::ModelLoad(e.to_string()))?;
     let repo = api.model(hf_repo.to_string());
 
     let dest = repo_dir(hf_repo);
@@ -232,7 +303,20 @@ pub async fn pull(hf_repo: &str) -> Result<PullReport> {
                 pulled.push(dst);
             }
             Err(e) => {
-                warn!(file = %f, error = %e, "skipped");
+                let dst = dest.join(f);
+                match download_direct(hf_repo, f, &dst).await {
+                    Ok(true) => {
+                        info!(file = %f, "pulled direct");
+                        pulled.push(dst);
+                    }
+                    Ok(false) => warn!(file = %f, error = %e, "skipped"),
+                    Err(direct) => warn!(
+                        file = %f,
+                        hf_hub_error = %e,
+                        direct_error = %direct,
+                        "skipped"
+                    ),
+                }
             }
         }
     }
@@ -258,7 +342,22 @@ pub async fn pull(hf_repo: &str) -> Result<PullReport> {
                         info!(file = %shard, "pulled shard");
                         pulled.push(dst);
                     }
-                    Err(e) => warn!(file = %shard, error = %e, "shard failed"),
+                    Err(e) => {
+                        let dst = dest.join(&shard);
+                        match download_direct(hf_repo, &shard, &dst).await {
+                            Ok(true) => {
+                                info!(file = %shard, "pulled shard direct");
+                                pulled.push(dst);
+                            }
+                            Ok(false) => warn!(file = %shard, error = %e, "shard failed"),
+                            Err(direct) => warn!(
+                                file = %shard,
+                                hf_hub_error = %e,
+                                direct_error = %direct,
+                                "shard failed"
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -278,8 +377,18 @@ fn copy_into(src: &Path, dst: &Path) -> std::io::Result<()> {
     if dst.exists() {
         return Ok(());
     }
+    if dst.symlink_metadata().is_ok() {
+        std::fs::remove_file(dst)?;
+    }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    let src_is_symlink = std::fs::symlink_metadata(src)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if src_is_symlink {
+        std::fs::copy(src, dst)?;
+        return Ok(());
     }
     match std::fs::hard_link(src, dst) {
         Ok(()) => Ok(()),
@@ -288,4 +397,57 @@ fn copy_into(src: &Path, dst: &Path) -> std::io::Result<()> {
             Ok(())
         }
     }
+}
+
+async fn download_direct(hf_repo: &str, file: &str, dst: &Path) -> Result<bool> {
+    if dst.exists() {
+        return Ok(true);
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        hf_repo,
+        file.split('/')
+            .map(url_component)
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| crate::Error::ModelLoad(format!("download {url}: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(crate::Error::ModelLoad(format!(
+            "download {url}: HTTP {}",
+            resp.status()
+        )));
+    }
+
+    let tmp = dst.with_extension("tmp");
+    let mut out = tokio::fs::File::create(&tmp).await?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| crate::Error::ModelLoad(format!("download {url}: {e}")))?;
+        out.write_all(&chunk).await?;
+    }
+    out.flush().await?;
+    drop(out);
+    std::fs::rename(tmp, dst)?;
+    Ok(true)
+}
+
+fn url_component(s: &str) -> String {
+    s.bytes()
+        .flat_map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![b as char]
+            }
+            _ => format!("%{b:02X}").chars().collect(),
+        })
+        .collect()
 }

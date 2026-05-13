@@ -185,6 +185,14 @@ pub struct ChatQuery {
     pub spec: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct GenerationOptions {
+    tools: Option<Vec<Value>>,
+    params: SamplingParams,
+    max_tokens: u32,
+    spec: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub error: ErrorPayload,
@@ -239,28 +247,22 @@ pub async fn chat_completions(
     // optionally retry once. Schema is exposed in the nudge so the
     // model can shape its output even without enforced constraints.
     let messages = inject_response_format(req.messages.clone(), req.response_format.as_ref());
+    let opts = GenerationOptions {
+        tools: req.tools.clone(),
+        params,
+        max_tokens,
+        spec: q.spec.clone(),
+    };
 
     if req.stream {
-        stream_response(
-            state,
-            req.model,
-            messages,
-            req.tools.clone(),
-            params,
-            max_tokens,
-            q.spec.clone(),
-        )
-        .await
+        stream_response(state, req.model, messages, opts).await
     } else {
         oneshot_response(
             state,
             req.model,
             messages,
-            req.tools.clone(),
-            params,
-            max_tokens,
+            opts,
             req.response_format.clone(),
-            q.spec.clone(),
         )
         .await
     }
@@ -291,7 +293,9 @@ fn inject_response_format(
         }
         _ => None,
     };
-    let Some(nudge) = nudge else { return messages; };
+    let Some(nudge) = nudge else {
+        return messages;
+    };
 
     if let Some(sys) = messages.iter_mut().find(|m| m.role == "system") {
         sys.content.push_str(&nudge);
@@ -352,30 +356,34 @@ async fn oneshot_response(
     state: AppState,
     model_id: String,
     messages: Vec<ChatMessage>,
-    tools: Option<Vec<Value>>,
-    params: SamplingParams,
-    max_tokens: u32,
+    opts: GenerationOptions,
     response_format: Option<Value>,
-    spec: Option<String>,
 ) -> Response {
     let model_id_for_payload = model_id.clone();
-    let tools_slice = tools.clone();
+    let tools_slice = opts.tools.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<_, base_mlx_core::Error> {
-        match spec {
-            Some(draft_id) => with_target_and_draft(&state, &model_id, &draft_id, |target, draft| {
-                let prompt = target.render_chat(&messages, tools_slice.as_deref());
-                let tokens = target.encode(&prompt)?;
-                instrumented("oneshot-spec", || {
-                    base_mlx_core::speculative::generate(
-                        target, draft, &tokens, &params, max_tokens, |_, _| {},
-                    )
-                })
-            })?,
+        match opts.spec {
+            Some(draft_id) => {
+                with_target_and_draft(&state, &model_id, &draft_id, |target, draft| {
+                    let prompt = target.render_chat(&messages, tools_slice.as_deref());
+                    let tokens = target.encode(&prompt)?;
+                    instrumented("oneshot-spec", || {
+                        base_mlx_core::speculative::generate(
+                            target,
+                            draft,
+                            &tokens,
+                            &opts.params,
+                            opts.max_tokens,
+                            |_, _| {},
+                        )
+                    })
+                })?
+            }
             None => with_loaded(&state, &model_id, |loaded| {
                 let prompt = loaded.render_chat(&messages, tools_slice.as_deref());
                 let tokens = loaded.encode(&prompt)?;
                 instrumented("oneshot", || {
-                    loaded.generate(&tokens, &params, max_tokens, |_, _| {})
+                    loaded.generate_text(&tokens, &opts.params, opts.max_tokens)
                 })
             })?,
         }
@@ -391,17 +399,27 @@ async fn oneshot_response(
                 "generation_failed",
             )
         }
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), "join_error"),
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string(),
+                "join_error",
+            )
+        }
     };
 
     // Post-hoc JSON validation when the caller asked for structured
     // output. On failure, return the raw text but flag it via a custom
     // header — a real retry pass would re-run with the error message
     // appended. Keeping v1 deterministic; retries are easy to add.
-    let json_valid = match response_format.as_ref().and_then(|r| r.get("type")).and_then(|t| t.as_str()) {
-        Some("json_object") | Some("json_schema") => Some(
-            serde_json::from_str::<Value>(gen.text.trim()).is_ok(),
-        ),
+    let json_valid = match response_format
+        .as_ref()
+        .and_then(|r| r.get("type"))
+        .and_then(|t| t.as_str())
+    {
+        Some("json_object") | Some("json_schema") => {
+            Some(serde_json::from_str::<Value>(gen.text.trim()).is_ok())
+        }
         _ => None,
     };
     if json_valid == Some(false) {
@@ -492,10 +510,7 @@ async fn stream_response(
     state: AppState,
     model_id: String,
     messages: Vec<ChatMessage>,
-    tools: Option<Vec<Value>>,
-    params: SamplingParams,
-    max_tokens: u32,
-    spec: Option<String>,
+    opts: GenerationOptions,
 ) -> Response {
     let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let created = SystemTime::now()
@@ -521,7 +536,7 @@ async fn stream_response(
 
     let id2 = id.clone();
     let model_id2 = model_id.clone();
-    let tools_for_task = tools.clone();
+    let tools_for_task = opts.tools.clone();
     tokio::task::spawn_blocking(move || {
         // The streaming callback is identical between single-model and
         // spec-dec paths — build it once and clone the captured channel
@@ -550,29 +565,42 @@ async fn stream_response(
             }
         };
 
-        let res = match spec {
-            Some(draft_id) => with_target_and_draft(&state, &model_id, &draft_id, |target, draft| {
-                let prompt = target.render_chat(&messages, tools_for_task.as_deref());
-                let tokens = match target.encode(&prompt) {
-                    Ok(t) => t,
-                    Err(e) => { push_error(&tx, &e); return None; }
-                };
-                let cb = make_cb();
-                Some(instrumented("stream-spec", || {
-                    base_mlx_core::speculative::generate(
-                        target, draft, &tokens, &params, max_tokens, cb,
-                    )
-                }))
-            }),
+        let res = match opts.spec {
+            Some(draft_id) => {
+                with_target_and_draft(&state, &model_id, &draft_id, |target, draft| {
+                    let prompt = target.render_chat(&messages, tools_for_task.as_deref());
+                    let tokens = match target.encode(&prompt) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            push_error(&tx, &e);
+                            return None;
+                        }
+                    };
+                    let cb = make_cb();
+                    Some(instrumented("stream-spec", || {
+                        base_mlx_core::speculative::generate(
+                            target,
+                            draft,
+                            &tokens,
+                            &opts.params,
+                            opts.max_tokens,
+                            cb,
+                        )
+                    }))
+                })
+            }
             None => with_loaded(&state, &model_id, |loaded| {
                 let prompt = loaded.render_chat(&messages, tools_for_task.as_deref());
                 let tokens = match loaded.encode(&prompt) {
                     Ok(t) => t,
-                    Err(e) => { push_error(&tx, &e); return None; }
+                    Err(e) => {
+                        push_error(&tx, &e);
+                        return None;
+                    }
                 };
                 let cb = make_cb();
                 Some(instrumented("stream", || {
-                    loaded.generate(&tokens, &params, max_tokens, cb)
+                    loaded.generate(&tokens, &opts.params, opts.max_tokens, cb)
                 }))
             }),
         };
@@ -586,7 +614,7 @@ async fn stream_response(
                     json!({
                         "tool_calls": serde_json::to_value(&gen.tool_calls).unwrap_or(Value::Null),
                     })
-                } else if tools.as_ref().is_some_and(|t| !t.is_empty()) {
+                } else if tools_for_task.as_ref().is_some_and(|t| !t.is_empty()) {
                     // Tools were offered but the model replied with
                     // plain content; deliver it all at once.
                     json!({ "content": gen.text })
@@ -627,8 +655,9 @@ fn push_error(
     tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
     e: &base_mlx_core::Error,
 ) {
-    let _ = tx.send(Ok(Event::default()
-        .data(json!({ "error": { "message": e.to_string() } }).to_string())));
+    let _ = tx.send(Ok(
+        Event::default().data(json!({ "error": { "message": e.to_string() } }).to_string())
+    ));
 }
 
 // ─── /v1/embeddings (not wired in v1) ───────────────────────────────────────

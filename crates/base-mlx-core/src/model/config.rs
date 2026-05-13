@@ -4,7 +4,8 @@
 //! loader can pick between dense and quantized linear layers.
 
 use crate::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::{Map, Value};
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -30,6 +31,15 @@ pub struct ModelConfig {
 
     pub vocab_size: usize,
 
+    #[serde(default)]
+    pub bos_token_id: Option<u32>,
+
+    #[serde(default, deserialize_with = "token_ids")]
+    pub eos_token_id: Vec<u32>,
+
+    #[serde(default)]
+    pub pad_token_id: Option<u32>,
+
     #[serde(default = "default_rms_eps")]
     pub rms_norm_eps: f32,
 
@@ -51,6 +61,66 @@ pub struct ModelConfig {
     pub quantization: Option<QuantConfig>,
     #[serde(default, rename = "quantization_config")]
     pub quantization_alt: Option<QuantConfig>,
+
+    /// Gemma 4 alternates sliding and full attention layers.
+    #[serde(default)]
+    pub layer_types: Vec<String>,
+    #[serde(default)]
+    pub rope_parameters: Option<Value>,
+    #[serde(default)]
+    pub global_head_dim: Option<usize>,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub num_kv_shared_layers: Option<usize>,
+    #[serde(default)]
+    pub hidden_size_per_layer_input: Option<usize>,
+    #[serde(default)]
+    pub vocab_size_per_layer_input: Option<usize>,
+    #[serde(default)]
+    pub final_logit_softcapping: Option<f32>,
+    #[serde(default)]
+    pub use_double_wide_mlp: bool,
+    #[serde(default)]
+    pub enable_moe_block: bool,
+    #[serde(default)]
+    pub attention_k_eq_v: bool,
+    #[serde(default)]
+    pub num_global_key_value_heads: Option<usize>,
+
+    /// Granite hybrid/Mamba2 settings.
+    #[serde(default)]
+    pub attention_bias: bool,
+    #[serde(default = "default_one")]
+    pub embedding_multiplier: f32,
+    #[serde(default = "default_one")]
+    pub attention_multiplier: f32,
+    #[serde(default = "default_one")]
+    pub logits_scaling: f32,
+    #[serde(default = "default_one")]
+    pub residual_multiplier: f32,
+    #[serde(default)]
+    pub shared_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub num_local_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub mamba_n_heads: Option<usize>,
+    #[serde(default)]
+    pub mamba_d_head: Option<usize>,
+    #[serde(default)]
+    pub mamba_d_state: Option<usize>,
+    #[serde(default)]
+    pub mamba_d_conv: Option<usize>,
+    #[serde(default)]
+    pub mamba_n_groups: Option<usize>,
+    #[serde(default)]
+    pub mamba_conv_bias: bool,
+    #[serde(default)]
+    pub mamba_proj_bias: bool,
+    #[serde(default = "default_position_embedding_type")]
+    pub position_embedding_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,11 +138,26 @@ fn default_rope_theta() -> f32 {
 fn default_max_pos() -> usize {
     4096
 }
+fn default_one() -> f32 {
+    1.0
+}
+fn default_position_embedding_type() -> String {
+    "rope".into()
+}
 
 impl ModelConfig {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        let mut cfg: ModelConfig = serde_json::from_str(&raw)?;
+        let value: Value = serde_json::from_str(&raw)?;
+        let mut cfg: ModelConfig = if value
+            .get("model_type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "gemma4")
+        {
+            serde_json::from_value(gemma4_text_config(value))?
+        } else {
+            serde_json::from_value(value)?
+        };
         if cfg.quantization.is_none() {
             cfg.quantization = cfg.quantization_alt.take();
         }
@@ -87,7 +172,7 @@ impl ModelConfig {
                 "hidden_size and num_attention_heads must be non-zero".into(),
             ));
         }
-        if self.hidden_size % self.num_attention_heads != 0 && self.head_dim.is_none() {
+        if !self.hidden_size.is_multiple_of(self.num_attention_heads) && self.head_dim.is_none() {
             return Err(Error::InvalidConfig(format!(
                 "hidden_size ({}) not divisible by num_attention_heads ({}) and no explicit head_dim",
                 self.hidden_size, self.num_attention_heads
@@ -114,4 +199,43 @@ impl ModelConfig {
     pub fn kv_dim(&self) -> usize {
         self.kv_heads() * self.per_head_dim()
     }
+}
+
+fn gemma4_text_config(root: Value) -> Value {
+    let mut text = root
+        .get("text_config")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    text.insert("model_type".into(), Value::String("gemma4".into()));
+    copy_field(&root, &mut text, "quantization");
+    copy_field(&root, &mut text, "quantization_config");
+    copy_field(&root, &mut text, "eos_token_id");
+
+    Value::Object(text)
+}
+
+fn copy_field(root: &Value, text: &mut Map<String, Value>, key: &str) {
+    if let Some(v) = root.get(key) {
+        text.insert(key.to_string(), v.clone());
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TokenIds {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+fn token_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<TokenIds>::deserialize(deserializer)? {
+        Some(TokenIds::One(id)) => vec![id],
+        Some(TokenIds::Many(ids)) => ids,
+        None => Vec::new(),
+    })
 }

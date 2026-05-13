@@ -62,8 +62,8 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,base_mlx=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,base_mlx=debug"));
     FmtSubscriber::builder().with_env_filter(filter).init();
 
     let cli = Cli::parse();
@@ -124,7 +124,8 @@ async fn main() -> Result<()> {
                 "model={model}  prompt_tokens={}  max_tokens={max_tokens}  runs={runs}",
                 tokens.len()
             );
-            println!("MLX cache (post-load):  active={:>6.1}MB  cached={:>6.1}MB",
+            println!(
+                "MLX cache (post-load):  active={:>6.1}MB  cached={:>6.1}MB",
                 bytes_to_mb(base_mlx_core::memory::active_bytes()?),
                 bytes_to_mb(base_mlx_core::memory::cache_bytes()?),
             );
@@ -134,15 +135,8 @@ async fn main() -> Result<()> {
             for r in 0..runs {
                 let label = if r == 0 { "warmup" } else { "run" };
                 let ttft_start = std::time::Instant::now();
-                let decode_start = std::cell::RefCell::new(None);
-                let counter = std::cell::Cell::new(0u32);
 
-                let res = loaded.generate(&tokens, &params, max_tokens, |_piece, _id| {
-                    if counter.get() == 0 {
-                        *decode_start.borrow_mut() = Some(std::time::Instant::now());
-                    }
-                    counter.set(counter.get() + 1);
-                })?;
+                let res = loaded.generate_text(&tokens, &params, max_tokens)?;
 
                 // Estimate TTFT and decode rate. We can't observe the first
                 // callback time directly here (callback is FnMut not
@@ -154,7 +148,7 @@ async fn main() -> Result<()> {
                 // We approximate by re-running a tiny generation just to
                 // get TTFT alone.
                 let ttft_start2 = std::time::Instant::now();
-                let _ = loaded.generate(&tokens, &params, 1, |_, _| {})?;
+                let _ = loaded.generate_text(&tokens, &params, 1)?;
                 let ttft = ttft_start2.elapsed().as_secs_f64();
                 let decode = (total - ttft).max(0.001);
                 let rate = (n - 1.0).max(0.0) / decode;
@@ -172,8 +166,12 @@ async fn main() -> Result<()> {
             let avg_ttft = ttfts.iter().skip(1).sum::<f64>() / n as f64;
             let avg_rate = decode_rates.iter().skip(1).sum::<f64>() / n as f64;
             println!();
-            println!("Average (excluding warmup):  ttft={:.3}s  decode={:.1} tok/s", avg_ttft, avg_rate);
-            println!("MLX cache (post-bench): active={:>6.1}MB  cached={:>6.1}MB",
+            println!(
+                "Average (excluding warmup):  ttft={:.3}s  decode={:.1} tok/s",
+                avg_ttft, avg_rate
+            );
+            println!(
+                "MLX cache (post-bench): active={:>6.1}MB  cached={:>6.1}MB",
                 bytes_to_mb(base_mlx_core::memory::active_bytes()?),
                 bytes_to_mb(base_mlx_core::memory::cache_bytes()?),
             );
@@ -184,100 +182,70 @@ async fn main() -> Result<()> {
             prompt,
             max_tokens,
         } => {
-            let repo = resolve_repo(&model);
-            let dir = base_mlx_core::pull::find_local(&repo).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{repo} not found locally — run `base-mlx pull {repo}` first",
-                )
-            })?;
-            let cfg = base_mlx_core::model::ModelConfig::from_path(dir.join("config.json"))?;
-            println!("Found at: {}", dir.display());
-            println!("Architecture: {}", cfg.model_type);
+            let loaded = base_mlx_core::engine::LoadedModel::load(&model)?;
+            println!("Architecture: {}", loaded.cfg.model_type);
             println!(
                 "  hidden={} layers={} heads={} kv_heads={} head_dim={} vocab={}",
-                cfg.hidden_size,
-                cfg.num_hidden_layers,
-                cfg.num_attention_heads,
-                cfg.kv_heads(),
-                cfg.per_head_dim(),
-                cfg.vocab_size,
+                loaded.cfg.hidden_size,
+                loaded.cfg.num_hidden_layers,
+                loaded.cfg.num_attention_heads,
+                loaded.cfg.kv_heads(),
+                loaded.cfg.per_head_dim(),
+                loaded.cfg.vocab_size,
             );
-            if let Some(q) = &cfg.quantization {
-                println!("  quantization: {}-bit, group_size={}", q.bits, q.group_size);
+            if let Some(q) = &loaded.cfg.quantization {
+                println!(
+                    "  quantization: {}-bit, group_size={}",
+                    q.bits, q.group_size
+                );
             }
-            println!(
-                "  rope_theta={} rms_eps={} tie_embed={}",
-                cfg.rope_theta, cfg.rms_norm_eps, cfg.tie_word_embeddings,
+            let chat_prompt = loaded.render_chat(
+                &[base_mlx_core::chat_template::ChatMessage {
+                    role: "user".into(),
+                    content: prompt.clone(),
+                    tool_call_id: None,
+                    name: None,
+                    tool_calls: None,
+                }],
+                None,
             );
-            let expected = base_mlx_core::model::Qwen3::expected_tensor_count(&cfg);
-            let actual = count_tensors(&dir)?;
-            println!("Tensors: expected {} | actual {}", expected, actual);
+            let tokens = loaded.encode(&chat_prompt)?;
+            println!(
+                "Prompt tokens: {} ({:?}...)",
+                tokens.len(),
+                &tokens[..tokens.len().min(8)]
+            );
 
-            // Tokenize the prompt.
-            let tok_path = dir.join("tokenizer.json");
-            let tok = base_mlx_core::tokenizer::Tokenizer::from_file(&tok_path)?;
-            let tokens = tok.encode(&prompt, false)?;
-            println!("Prompt tokens: {} ({:?}…)", tokens.len(), &tokens[..tokens.len().min(8)]);
-
-            // Load the model.
-            println!("Loading weights…");
-            let t0 = std::time::Instant::now();
-            let model = base_mlx_core::model::Qwen3::load(&dir, cfg)?;
-            println!("  loaded in {:.2}s", t0.elapsed().as_secs_f32());
-
-            // Greedy decode loop. O(n²) without a KV cache — fine for v1
-            // verification; KV cache lands in the next milestone.
             use std::io::Write;
             print!("\nGeneration: {}", prompt);
             std::io::stdout().flush().ok();
-
-            let mut cache = base_mlx_core::model::qwen3::KvCache::new();
-            // Prefill the prompt in one go.
-            let t_prefill = std::time::Instant::now();
-            let mut logits = model.forward(&tokens, &mut cache)?;
-            logits.eval().ok();
-            let prefill_ms = t_prefill.elapsed().as_secs_f32() * 1000.0;
-
             let t1 = std::time::Instant::now();
-            let mut produced = 0u32;
-            let mut next: u32;
-            loop {
-                let argmax = mlx_rs::ops::indexing::argmax(&logits, false)
-                    .map_err(|e| anyhow::anyhow!("argmax: {e}"))?;
-                argmax.eval().ok();
-                next = argmax.as_slice::<u32>()[0];
-                produced += 1;
-                // EOS: 151645 = <|im_end|>, 151643 = <|endoftext|>.
-                if next == 151645 || next == 151643 {
-                    break;
-                }
-                let piece = tok.decode(&[next], false)?;
+            let params = base_mlx_core::sampler::SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                seed: None,
+                grammar: None,
+            };
+            let result = loaded.generate(&tokens, &params, max_tokens, |piece, _| {
                 print!("{}", piece);
                 std::io::stdout().flush().ok();
-                if produced >= max_tokens {
-                    break;
-                }
-                // Feed one token at a time; cache holds the rest.
-                logits = model.forward(&[next], &mut cache)?;
-            }
+            })?;
             let decode_s = t1.elapsed().as_secs_f32();
-            let decode_only = (produced.saturating_sub(1)) as f32;
             println!(
-                "\n[prefill {} tok in {:.0}ms · decode {} tok in {:.2}s → {:.1} tok/s]",
+                "\n[prompt {} tok · decode {} tok in {:.2}s -> {:.1} tok/s]",
                 tokens.len(),
-                prefill_ms,
-                produced,
+                result.completion_tokens,
                 decode_s,
-                decode_only / decode_s.max(0.001),
+                result.completion_tokens as f32 / decode_s.max(0.001),
             );
             Ok(())
         }
         Cmd::Inspect { model, limit } => {
             let repo = resolve_repo(&model);
             let dir = base_mlx_core::pull::find_local(&repo).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{repo} not found locally — run `base-mlx pull {repo}` first",
-                )
+                anyhow::anyhow!("{repo} not found locally — run `base-mlx pull {repo}` first",)
             })?;
             println!("Found at: {}", dir.display());
             inspect_safetensors(&dir, limit)
@@ -298,23 +266,6 @@ fn resolve_repo(id_or_repo: &str) -> String {
 
 fn bytes_to_mb(b: usize) -> f64 {
     b as f64 / 1024.0 / 1024.0
-}
-
-fn count_tensors(dir: &std::path::Path) -> anyhow::Result<usize> {
-    use safetensors::SafeTensors;
-    let mut shards: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
-        .collect();
-    shards.sort();
-    let mut total = 0usize;
-    for shard in &shards {
-        let bytes = std::fs::read(shard)?;
-        let st = SafeTensors::deserialize(&bytes)?;
-        total += st.names().len();
-    }
-    Ok(total)
 }
 
 fn inspect_safetensors(dir: &std::path::Path, limit: usize) -> anyhow::Result<()> {
@@ -339,12 +290,7 @@ fn inspect_safetensors(dir: &std::path::Path, limit: usize) -> anyhow::Result<()
         for name in names {
             if printed < limit {
                 let view = st.tensor(name)?;
-                println!(
-                    "  {:60}  {:?}  {:?}",
-                    name,
-                    view.shape(),
-                    view.dtype()
-                );
+                println!("  {:60}  {:?}  {:?}", name, view.shape(), view.dtype());
                 printed += 1;
             }
         }

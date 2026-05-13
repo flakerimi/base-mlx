@@ -3,39 +3,40 @@
 //! model_id; concurrent requests serialize through it (until we add
 //! continuous batching).
 
-use crate::chat_template::{qwen3_chat, ChatMessage, ToolCall};
-use crate::model::{ModelConfig, Qwen3};
-use crate::model::qwen3::KvCache;
+use crate::chat_template::{gemma4_chat, granite_chat, qwen3_chat, ChatMessage, ToolCall};
+use crate::model::{Architecture, ModelConfig};
 use crate::pull;
 use crate::sampler::SamplingParams;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{Tokenizer, Utf8TokenDecoder};
 use crate::{Error, Result};
 
 use mlx_rs::Array;
-
-/// Qwen3 EOS tokens.
-const EOS: &[u32] = &[151645 /* <|im_end|> */, 151643 /* <|endoftext|> */];
 
 pub struct LoadedModel {
     pub id: String,
     pub repo: String,
     pub cfg: ModelConfig,
     pub tokenizer: Tokenizer,
-    pub model: Qwen3,
+    pub model: Architecture,
 }
 
 impl LoadedModel {
     /// Load by registry id (e.g. `qwen3-4b-instruct`) or HF repo string.
     pub fn load(id_or_repo: &str) -> Result<Self> {
-        let repo = resolve_repo(id_or_repo);
-        let dir = pull::find_local(&repo).ok_or_else(|| {
+        let (repo, exact_repo) = resolve_repo(id_or_repo);
+        let dir = if exact_repo {
+            pull::find_local_exact(&repo)
+        } else {
+            pull::find_local(&repo)
+        }
+        .ok_or_else(|| {
             Error::ModelLoad(format!(
                 "{repo} not found locally — pull it first (or place under ~/.lmstudio/models/…)",
             ))
         })?;
         let cfg = ModelConfig::from_path(dir.join("config.json"))?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
-        let model = Qwen3::load(&dir, cfg.clone())?;
+        let model = Architecture::load(&dir, cfg.clone())?;
         let loaded = Self {
             id: id_or_repo.to_string(),
             repo,
@@ -47,16 +48,15 @@ impl LoadedModel {
         Ok(loaded)
     }
 
-    /// One throwaway forward pass to compile the qkv/mlp kernels and
-    /// prime the Metal compute pipeline. Without this the first real
-    /// request pays the full compilation cost — measured at ~2x slower
-    /// than warm steady-state on Qwen3-4B.
+    /// One throwaway forward pass to prime the Metal compute pipeline,
+    /// cache shapes, and KV update path. Without this the first real
+    /// request pays a cold-start tax — measured at ~2x slower than warm
+    /// steady-state on Qwen3-4B.
     fn warmup(&self) {
-        let mut cache = KvCache::new();
+        let mut cache = self.model.new_cache();
         // Two BOS tokens: one prefill (multi-token path) + one decode
-        // step (single-token path). Both kernels are compiled separately
-        // by mlx::compile because their input shapes differ.
-        let bos: u32 = 151643; // <|endoftext|> — safe filler for Qwen3 family
+        // step (single-token path).
+        let bos: u32 = self.cfg.bos_token_id.unwrap_or(self.model.warmup_token());
         if let Ok(logits) = self.model.forward(&[bos, bos], &mut cache) {
             drop(logits);
             if let Ok(logits) = self.model.forward(&[bos], &mut cache) {
@@ -69,12 +69,12 @@ impl LoadedModel {
     /// Render a chat with this model's template. `tools` is the raw
     /// OpenAI tools array (each entry is a `{type:"function",function:{...}}`
     /// object); we hand it straight to the template.
-    pub fn render_chat(
-        &self,
-        msgs: &[ChatMessage],
-        tools: Option<&[serde_json::Value]>,
-    ) -> String {
-        qwen3_chat(msgs, tools)
+    pub fn render_chat(&self, msgs: &[ChatMessage], tools: Option<&[serde_json::Value]>) -> String {
+        match self.cfg.model_type.as_str() {
+            "gemma4" => gemma4_chat(msgs, tools),
+            "granitemoehybrid" => granite_chat(msgs, tools),
+            _ => qwen3_chat(msgs, tools),
+        }
     }
 
     /// Encode a rendered prompt to token ids.
@@ -93,57 +93,28 @@ impl LoadedModel {
         max_new_tokens: u32,
         mut on_token: F,
     ) -> Result<GenerationResult> {
-        let mut cache = KvCache::new();
+        let mut cache = self.model.new_cache();
         // Prefill.
         let mut logits = self.model.forward(prompt_tokens, &mut cache)?;
-        let mut text = String::new();
-        // Buffer of *all* generated token ids so far. We decode the
-        // whole buffer each step and emit only the newly-completed
-        // suffix — this collapses the multi-byte UTF-8 boundary bug
-        // (single-token decode of a byte mid-codepoint returns `�`).
-        let mut produced_ids: Vec<u32> = Vec::with_capacity(max_new_tokens as usize + 1);
+        let mut decoder = Utf8TokenDecoder::new();
         let mut produced = 0u32;
         let mut finish = "length";
 
         loop {
             let next = self.pick_next(&logits, params)?;
             produced += 1;
-            if EOS.contains(&next) {
+            if self.is_eos(next) {
                 finish = "stop";
                 break;
             }
-            produced_ids.push(next);
-            let full = self.tokenizer.decode(&produced_ids, false)?;
-            // Hold back the trailing fragment if it ends mid-codepoint —
-            // tokenizers render incomplete bytes as `\u{FFFD}`. We slice
-            // off any trailing replacement character so it can complete
-            // on the next step.
-            let emit_end = match full.rfind('\u{FFFD}') {
-                Some(idx) if idx == full.len() - '\u{FFFD}'.len_utf8() => idx,
-                _ => full.len(),
-            };
-            if emit_end > text.len() {
-                let piece = &full[text.len()..emit_end];
-                on_token(piece, next);
-                text.push_str(piece);
-            }
+            decoder.push(&self.tokenizer, next, &mut on_token)?;
             if produced >= max_new_tokens {
                 break;
             }
             logits = self.model.forward(&[next], &mut cache)?;
         }
 
-        // Drain any final pending bytes (e.g. EOS landed mid-codepoint).
-        if !produced_ids.is_empty() {
-            let full = self.tokenizer.decode(&produced_ids, false)?;
-            if full.len() > text.len() {
-                let tail = &full[text.len()..];
-                if !tail.contains('\u{FFFD}') {
-                    on_token(tail, 0);
-                    text.push_str(tail);
-                }
-            }
-        }
+        let text = decoder.finish(&self.tokenizer, &mut on_token)?;
 
         // Extract tool calls from the final text. If any are present we
         // bubble them up via `finish_reason: "tool_calls"` per the
@@ -172,6 +143,55 @@ impl LoadedModel {
         })
     }
 
+    /// Greedy / sampled generation for callers that only need the final
+    /// text. This avoids per-token tokenizer decode work on the hot
+    /// path, which matters for long non-streaming responses and benches.
+    pub fn generate_text(
+        &self,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+        max_new_tokens: u32,
+    ) -> Result<GenerationResult> {
+        let mut cache = self.model.new_cache();
+        let mut logits = self.model.forward(prompt_tokens, &mut cache)?;
+        let mut produced_ids: Vec<u32> = Vec::with_capacity(max_new_tokens as usize + 1);
+        let mut produced = 0u32;
+        let mut finish = "length";
+
+        loop {
+            let next = self.pick_next(&logits, params)?;
+            produced += 1;
+            if self.is_eos(next) {
+                finish = "stop";
+                break;
+            }
+            produced_ids.push(next);
+            if produced >= max_new_tokens {
+                break;
+            }
+            logits = self.model.forward(&[next], &mut cache)?;
+        }
+
+        let text = self.tokenizer.decode(&produced_ids, false)?;
+        let (clean, tool_calls) = crate::chat_template::extract_tool_calls(&text);
+        let finish_reason = if !tool_calls.is_empty() {
+            "tool_calls".to_string()
+        } else {
+            finish.to_string()
+        };
+
+        cache.reset();
+        drop(logits);
+
+        Ok(GenerationResult {
+            text: clean,
+            prompt_tokens: prompt_tokens.len() as u32,
+            completion_tokens: produced,
+            finish_reason,
+            tool_calls,
+        })
+    }
+
     fn pick_next(&self, logits: &Array, params: &SamplingParams) -> Result<u32> {
         // Greedy when temperature == 0 — fast, deterministic, no allocation.
         if params.temperature <= 0.0 {
@@ -186,7 +206,9 @@ impl LoadedModel {
         let logits_f32 = logits
             .as_dtype(mlx_rs::Dtype::Float32)
             .map_err(|e| Error::Inference(e.to_string()))?;
-        logits_f32.eval().map_err(|e| Error::Inference(e.to_string()))?;
+        logits_f32
+            .eval()
+            .map_err(|e| Error::Inference(e.to_string()))?;
         let mut probs: Vec<f32> = logits_f32.as_slice::<f32>().to_vec();
         let t = params.temperature.max(1e-5);
         for p in probs.iter_mut() {
@@ -240,6 +262,14 @@ impl LoadedModel {
         }
         Ok(top.last().map(|(i, _)| *i as u32).unwrap_or(0))
     }
+
+    pub fn is_eos(&self, token: u32) -> bool {
+        if !self.cfg.eos_token_id.is_empty() {
+            self.cfg.eos_token_id.contains(&token)
+        } else {
+            matches!(token, 151645 | 151643)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -253,13 +283,17 @@ pub struct GenerationResult {
     pub tool_calls: Vec<ToolCall>,
 }
 
-fn resolve_repo(id_or_repo: &str) -> String {
+fn resolve_repo(id_or_repo: &str) -> (String, bool) {
     if id_or_repo.contains('/') {
-        return id_or_repo.to_string();
+        return (id_or_repo.to_string(), true);
     }
-    crate::registry::default_catalog()
+    if let Some(repo) = crate::registry::default_catalog()
         .into_iter()
         .find(|m| m.id == id_or_repo)
         .map(|m| m.hf_repo)
-        .unwrap_or_else(|| id_or_repo.to_string())
+    {
+        (repo, true)
+    } else {
+        (id_or_repo.to_string(), false)
+    }
 }

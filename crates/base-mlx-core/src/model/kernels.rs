@@ -39,12 +39,9 @@ pub fn qkv_block(args: &[Array]) -> Vec<Array> {
     let v_b = &args[10];
 
     let h = mlx_rs::fast::rms_norm(x, in_norm_w, EPS).expect("rms_norm");
-    let q =
-        mlx_rs::ops::quantized_matmul(&h, q_w, q_s, q_b, true, GROUP, BITS).expect("q_proj");
-    let k =
-        mlx_rs::ops::quantized_matmul(&h, k_w, k_s, k_b, true, GROUP, BITS).expect("k_proj");
-    let v =
-        mlx_rs::ops::quantized_matmul(&h, v_w, v_s, v_b, true, GROUP, BITS).expect("v_proj");
+    let q = mlx_rs::ops::quantized_matmul(&h, q_w, q_s, q_b, true, GROUP, BITS).expect("q_proj");
+    let k = mlx_rs::ops::quantized_matmul(&h, k_w, k_s, k_b, true, GROUP, BITS).expect("k_proj");
+    let v = mlx_rs::ops::quantized_matmul(&h, v_w, v_s, v_b, true, GROUP, BITS).expect("v_proj");
     vec![q, k, v]
 }
 
@@ -71,8 +68,8 @@ pub fn mlp_block(args: &[Array]) -> Vec<Array> {
     let h = mlx_rs::fast::rms_norm(x, post_norm_w, EPS).expect("post_norm");
     let gate = mlx_rs::ops::quantized_matmul(&h, gate_w, gate_s, gate_b, true, GROUP, BITS)
         .expect("gate_proj");
-    let up = mlx_rs::ops::quantized_matmul(&h, up_w, up_s, up_b, true, GROUP, BITS)
-        .expect("up_proj");
+    let up =
+        mlx_rs::ops::quantized_matmul(&h, up_w, up_s, up_b, true, GROUP, BITS).expect("up_proj");
     let activated = mlx_rs::nn::silu(&gate).expect("silu");
     let gated = &activated * &up;
     let down = mlx_rs::ops::quantized_matmul(&gated, down_w, down_s, down_b, true, GROUP, BITS)
